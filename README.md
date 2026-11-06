@@ -3,6 +3,8 @@
 PyTorch training library: FSDP2/HSDP/DDP, tensor/pipeline/expert parallelism (3D), DeepSpeed ZeRO backend,
 FP8 (Transformer Engine / torchao) and INT8 training, smart gradient/activation/expert offload, MoE, packed
 Triton kernels, device autotuning, an asynchronous batch pipeline, and a full trainer.
+It is an **extension, not a framework**: every kernel and block below is usable on its own,
+inside an architecture you already have.
 
 **Docs:** [documentation.md](documentation.md) — guide, API and config reference ·
 [PERF.md](PERF.md) — performance/sync audit · [OFFLOAD.md](OFFLOAD.md) — offload design and rejected ideas.
@@ -26,7 +28,7 @@ kernels fall back to torch with identical numerics.
 ```bash
 torchrun --nproc_per_node=4 examples/train_gpt.py --moe --dp-replicate 4 --ep 2
 torchrun --nproc_per_node=4 examples/train_gpt.py --tp 2 --dp-shard 2
-pytest tests/               # 117 tests: trainer, parallel, kernels, forge, async batches, autotune, offload
+pytest tests/               # 140 tests: trainer, parallel, kernels, forge, async batches, autotune, offload
 torchrun --standalone --nproc_per_node=2 tests/mp_check.py ep_equiv   # also ddp, fsdp, pp, tp, prefetch, ...
 ```
 
@@ -51,8 +53,8 @@ trainer.close()
 
 The model factory receives the `DistContext`, so it can size itself per rank. A dataset is any
 `torch.utils.data.Dataset` returning `{"input_ids": ..., "labels": ...}`. `train_step()` returns
-`{"step", "loss", "lr", "grad_norm", "tok_s", "dt", "skipped"}`, plus `mfu` / `mem_gb` when they
-apply — see
+`{"step", "loss", "lr", "grad_norm", "dt", "skipped"}`, plus `tok_s` (needs `model.cfg.max_seq`),
+`mfu` and `mem_gb` when they apply — see
 [documentation.md §5.1](documentation.md#51-train-a-gpt-with-trainer).
 
 ## Your own model, two lines
@@ -83,6 +85,45 @@ main()                # module-level function; works unchanged under torchrun
 
 Mesh: world = pp * dp_replicate * dp_shard * tp; `ep` divides the DP world.
 
+## Bring your own architecture
+
+Nothing requires `GPT`, `Trainer` or `Forge`. Take one op, one block, or fuse one module of your
+own model.
+
+```python
+import torch, torch.nn as nn
+import forgemind as fm
+from forgemind import nn as fmnn
+
+y = fm.kernels.rms_norm(x, w, eps=1e-6)        # == F.rms_norm(x, (d,), w, eps)
+y = fm.kernels.swiglu(gate, up)                # == F.silu(gate) * up
+xn, y = fm.kernels.add_rms_norm(x, delta, w)   # residual + norm in one pass
+
+class MyBlock(nn.Module):
+    def __init__(self, dim, hidden):
+        super().__init__()
+        self.norm = fmnn.RMSNorm(dim)          # drop-in for nn.RMSNorm (same `weight`, same state_dict)
+        self.mlp = fmnn.SwiGLU(dim, hidden)    # w2(silu(w1 x) * w3 x), fused epilogue
+
+    def forward(self, h):
+        return h + self.mlp(self.norm(h))
+
+fm.kernels.patch(model.norm)                   # ...or fuse a module you already wrote
+fm.kernels.patch(model.mlp, split=True)        #     (kind="norm"/"mlp" if the name says nothing)
+```
+
+| you want | use | notes |
+|---|---|---|
+| one fused op | `fm.kernels.rms_norm` / `swiglu` / `swiglu_split` / `add_rms_norm` / `qk_norm_rope` | differentiable, dtype-preserving, torch expression when Triton is absent |
+| one block | `fmnn.RMSNorm(dim)` / `fmnn.SwiGLU(dim, hidden)` | plain `nn.Module`s; `RMSNorm` is `nn.RMSNorm`-compatible, `SwiGLU(split=True)` fuses gate\|up into one GEMM |
+| your own module | `fm.kernels.patch(m, split=False, kind=None)` | returns `True` if recognised, idempotent, preserves biases, works on torch's classes too |
+| the whole tree | `fm.kernels.enable(model)` | what `Trainer` does when `fused_ops=True` |
+
+`Trainer` accepts any factory as long as `model(tokens, labels=None) -> (ce, aux)`; DDP/FSDP2,
+accumulation, AC, `torch.compile`, offload, async batches and checkpointing all apply unchanged
+(TP/PP/EP still need this repo's model). Guide:
+[documentation.md §5.3](documentation.md#53-bring-your-own-architecture).
+
 ## Asynchronous batches
 
 The loader runs on a background thread, so while step *k* computes, batch *k+1* is being assembled
@@ -108,7 +149,7 @@ GIL-bound and therefore a no-op — the win is measured for the GPU-shaped case,
 Cost model: a step costs `max(load, step)` instead of `load + step` — measured 40.5 → 23.0 ms/batch
 (0.57x) when the step doesn't need the interpreter. `fm.async_loader`, `fm.to_device` and the
 dataset/sampler contract are documented in
-[documentation.md §5.4](documentation.md#54-datasets-and-loading).
+[documentation.md §5.5](documentation.md#55-datasets-and-loading).
 
 ## Parallelism
 
@@ -205,6 +246,7 @@ print(trainer.feed.report())       # batch pipeline: wait_ms_per_batch, stalled,
 | you want | read |
 |---|---|
 | a working example for each API | [documentation.md §3–5](documentation.md#3-the-two-minute-tour) |
+| using one kernel or block in your own model | [documentation.md §5.3](documentation.md#53-bring-your-own-architecture) |
 | every function and its signature | [documentation.md §6](documentation.md#6-api-reference) |
 | every config field and its default | [documentation.md §7](documentation.md#7-configuration-reference) |
 | the kernel API | [documentation.md §8](documentation.md#8-kernels-reference) |
@@ -229,7 +271,7 @@ The rest (quantization backends, offload+PP, empty `evaluate()`, OOM tuning) is 
 
 ## Status
 
-Verified on CPU/gloo (see `tests/`, 117 tests): dense/MoE training, grad accumulation, checkpoint+resume,
+Verified on CPU/gloo (see `tests/`, 140 tests): dense/MoE training, grad accumulation, checkpoint+resume,
 offload optimizer equivalence (and the chunked/pipelined path), AC modes, DDP/FSDP2/HSDP/TP/PP/3D, EP
 equivalence, `torch.compile` (`aot_eager`) with `fullgraph=True` and eager-gradient equivalence, the
 packed Triton kernels run through Triton's CPU interpreter (forward *and* backward vs torch), the

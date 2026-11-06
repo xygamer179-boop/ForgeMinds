@@ -9,12 +9,17 @@ from .data import (SyntheticLM, TokenFile, BatchStream, ResumableSampler, build_
 from .perf import count_host_syncs, host_syncs
 from .forge import Forge, launch
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 
 def __getattr__(name):
-    """Lazy submodule access: ``fm.kernels`` only imports triton when you touch it."""
-    if name in ("kernels", "forge", "autotune"):
+    """Lazy submodule access: ``fm.kernels`` only imports triton when you touch it.
+
+    ``fm.nn`` (the composable ``RMSNorm`` / ``SwiGLU`` blocks) is lazy for the same reason: it
+    pulls in the kernels package, and ``import forgemind`` should stay cheap for people who only
+    want the trainer.
+    """
+    if name in ("kernels", "forge", "autotune", "nn"):
         import importlib
         return importlib.import_module(f".{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

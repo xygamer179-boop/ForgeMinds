@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "forgemind"
-version = "0.4.0"
+version = "0.5.0"
 description = "ForgeMind: PyTorch training library - FSDP2/DDP/TP/PP/EP, DeepSpeed ZeRO, FP8/INT8 quantized training, smart offload, MoE"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.6", "numpy"]

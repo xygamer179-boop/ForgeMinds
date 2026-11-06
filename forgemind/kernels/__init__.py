@@ -12,6 +12,7 @@ available -- so importing this package never breaks a CPU or MPS run.
     loss = fm.kernels.kl_distill_loss(hs, ht, w, teacher_head)   # KL(teacher || student)
 
     fm.kernels.enable(model)                     # patch RMSNorm/SwiGLU modules in place
+    fm.kernels.patch(model.norm)                 # ...or one module at a time
     fm.kernels.set_backend("fallback")           # force the torch path (A/B, debugging)
     fm.kernels.stats()                           # which path ran, and how often
 
@@ -22,7 +23,7 @@ with a test behind it rather than a hope.
 
 from . import _common
 from ._common import HAS_TRITON, get_backend, reset_stats, set_backend, stats
-from .apply import enable
+from .apply import enable, patch
 from .kl import distill_kl, kl_distill_loss, kl_div, kl_div_logits
 from .norm import add_rms_norm, rms_norm
 from .rope import qk_norm_rope
@@ -32,7 +33,7 @@ __all__ = [
     "HAS_TRITON", "set_backend", "get_backend", "stats", "reset_stats",
     "rms_norm", "add_rms_norm", "qk_norm_rope", "swiglu", "swiglu_split",
     "kl_div_logits", "kl_div", "kl_distill_loss", "distill_kl",
-    "enable", "available",
+    "enable", "patch", "available",
 ]
 
 
