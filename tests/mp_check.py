@@ -107,6 +107,33 @@ elif sc == "pp_equiv":
         for n, p in m.named_parameters():
             assert torch.allclose(p.grad, refp[n].grad, atol=1e-4), (sched, n, (p.grad - refp[n].grad).abs().max())
         if ctx.rank == 0: print(f"RESULT pp_equiv[{sched}]: loss + stage grads match single-process reference", flush=True)
+elif sc == "prefetch":
+    # Rank skew: every rank must see exactly the batches the serial path would give it,
+    # in the same order and count -- the prefetch thread must not reorder or drop anything.
+    from forgemind.data import BatchStream
+    ctx = init_distributed(ParallelConfig(dp_replicate=2))
+    ds = SyntheticLM(64, 32, n=512)
+    dl, sampler = build_loader(ds, 8, ctx)
+    serial = BatchStream(dl, sampler, ctx.device, threaded=False)
+    ref = [serial.next()[0].clone() for _ in range(12)]
+    serial.close()
+    dl, sampler = build_loader(ds, 8, ctx)
+    fast = BatchStream(dl, sampler, ctx.device, threaded=True, depth=3)
+    got = [fast.next()[0].clone() for _ in range(12)]
+    rep = fast.report()
+    fast.close()
+    assert len(got) == 12 and all(torch.equal(a, b) for a, b in zip(ref, got)), ctx.rank
+    n = torch.tensor([len(got)], dtype=torch.long)
+    lens = [torch.zeros_like(n) for _ in range(ctx.world)]
+    dist.all_gather(lens, n)
+    assert all(int(x) == 12 for x in lens), lens          # no rank lagged or over-ran
+    assert rep["threaded"] is True
+    mine = ref[0][0, :4].tolist()
+    other = [None for _ in range(ctx.world)]
+    dist.all_gather_object(other, mine)
+    if ctx.rank == 0:
+        print(f"RESULT prefetch: 12/12 batches identical to serial per rank, "
+              f"wait {rep['wait_ms_per_batch']} ms/batch, stalls {rep['stalled']}", flush=True)
 else:
     raise SystemExit("unknown scenario")
 dist.barrier(); cleanup()

@@ -40,6 +40,28 @@ main()
 
 Mesh: world = pp * dp_replicate * dp_shard * tp; `ep` divides the DP world.
 
+## Asynchronous batches
+
+The loader runs on a background thread, so while step *k* computes, batch *k+1* is being assembled
+**and** copied to the device on a side stream. Training and eval both use it; nothing to configure.
+
+```python
+trainer = Trainer(model_fn, cfg, dataset, micro_batch=8)   # on by default (auto)
+for step in range(1000):
+    trainer.train_step()
+print(trainer.feed.report())     # {'wait_ms_per_batch': 0.04, 'stalled': 0, 'produce_ms': ..., 'depth': 2}
+
+# your own loop, same machinery:
+for x, y in fm.async_loader(DataLoader(ds, 64, pin_memory=True), "cuda", depth=2):
+    loss = criterion(model(x), y)
+```
+
+Pipeline depth is `TrainConfig.prefetch_depth` (2 = double buffer). `batch_thread=False` restores
+strictly serial order and RNG for bit-exact comparisons, and `Trainer.close()` / `Forge.fit()`
+always stop the thread (no leaked workers, no leaked CUDA streams). On a CPU-only box this is
+GIL-bound and therefore a no-op — the win is measured for the GPU-shaped case, see
+[PERF.md §8](PERF.md).
+
 ## Packed kernels
 
 `fm.kernels` has fused Triton kernels for the ops that are usually *several* eager kernels:
@@ -96,6 +118,7 @@ print(c.report())
 | `TrainConfig.compile` / `compile_mode` / `compile_backend` / `compile_fullgraph` | off / `default` / `inductor` / off | compiles each transformer block (caches are warmed first); `fullgraph=True` refuses to fall back |
 | `TrainConfig.ac` / `ac_preserve_rng` | `none` / `False` | full or selective checkpointing; leave RNG preservation off unless you use dropout |
 | `TrainConfig.prefetch` / `workers` | `True` / `0` | overlap the next batch's H2D copy on a side stream; `workers>0` adds a DataLoader pool |
+| `TrainConfig.batch_thread` / `prefetch_depth` | auto (workers==0 or CUDA) / 2 | run the **loader** on a background thread so batch *k+1* is assembled (and copied) while step *k* computes; `False` restores bit-exact serial order. `trainer.feed.report()` shows `wait_ms_per_batch` / `stalled` |
 | `OffloadConfig.optimizer` / `smart` / `gpu_watermark` | off / on / 0 | fp32 master + Adam states in pinned host RAM, grads streamed on a side stream |
 | `OffloadConfig.pipeline_chunks` | 4 | overlap the grad DMA of chunk *k+1* with the host Adam update of chunk *k*; `opt.report()` shows the split (see [OFFLOAD.md](OFFLOAD.md)) |
 | `OffloadConfig.activations` / `act_pool` | off / on | spill large saved activations to pinned host memory, recycling buffers |
@@ -103,16 +126,19 @@ print(c.report())
 | `GPTConfig.expert_grouped_mm` | `True` | `torch._grouped_mm` expert GEMMs (CUDA+bf16): removes the last host read from the MoE dispatch |
 | `GPTConfig.rope_high_precision` | `False` | compute the rotation in fp32 (slower, marginally more accurate) |
 | `ParallelConfig.ddp_static_graph` | `False` | skip DDP's per-iteration unused-parameter scan |
+| `fm.async_loader(loader, device, depth=2)` | -- | the same prefetcher for your own loop: `for x, y in fm.async_loader(dl, "cuda"): ...` |
 
 ## Status
 
-Verified on CPU/gloo (see `tests/`, 90 tests): dense/MoE training, grad accumulation, checkpoint+resume,
+Verified on CPU/gloo (see `tests/`, 111 tests): dense/MoE training, grad accumulation, checkpoint+resume,
 offload optimizer equivalence (and the chunked/pipelined path), AC modes, DDP/FSDP2/HSDP/TP/PP/3D, EP
 equivalence, `torch.compile` (`aot_eager`) with `fullgraph=True` and eager-gradient equivalence, the
 packed Triton kernels run through Triton's CPU interpreter (forward *and* backward vs torch), the
-`Forge` façade (including a 2-process DDP launch), autotuning, and a one-host-sync-per-step budget.
+`Forge` façade (including a 2-process DDP launch), autotuning, the asynchronous batch pipeline (order,
+overlap, rank alignment, resume, thread/worker cleanup), and a one-host-sync-per-step budget.
 
-Untested here (no accelerator): CUDA offload streams and the pipelined overlap they enable, kernel
+Untested here (no accelerator): CUDA offload streams and the pipelined overlap they enable, async H2D
+overlap and pinned-buffer reuse in the batch pipeline, kernel
 launches on real hardware (correctness is verified through the interpreter, *speed* is not), fused
 kernels under `torch.compile` on CUDA, `torch._grouped_mm` dispatch, TE/torchao FP8/INT8 training,
 DeepSpeed engine, NCCL.

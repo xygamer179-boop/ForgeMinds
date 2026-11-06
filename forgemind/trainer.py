@@ -15,7 +15,7 @@ from torch.utils.data import Dataset
 
 from .config import ForgeConfig
 from .distributed import init_distributed, DistContext, log
-from .data import build_loader, BatchStream
+from .data import build_loader, BatchStream, async_loader
 from .loss import logits_cross_entropy
 from .kernels import available as kernels_available
 from .offload import OffloadedAdamW, apply_activation_offload
@@ -129,7 +129,9 @@ class Trainer:
 
         # ---- data
         self.train_dl, self.sampler = build_loader(train_ds, micro_batch, ctx, tc.seed, workers=tc.workers)
-        self.feed = BatchStream(self.train_dl, self.sampler, ctx.device, prefetch=tc.prefetch)
+        self.feed = BatchStream(self.train_dl, self.sampler, ctx.device, prefetch=tc.prefetch,
+                                depth=getattr(tc, "prefetch_depth", 2),
+                                threaded=getattr(tc, "batch_thread", None))
         self.eval_dl = build_loader(eval_ds, micro_batch, ctx, tc.seed, workers=0, shuffle=False)[0] \
             if eval_ds is not None else None
 
@@ -326,18 +328,40 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate(self):
+        """Eval loop on the same async pipeline as training: the GPU should not wait for the host
+        here either, and eval is often 10-30% of a real run's wall clock."""
         if self.eval_dl is None or self.cfg.parallel.pp > 1 or self.use_ds:
             return None
         self.model.eval()
         tot, n = torch.zeros((), device=self.ctx.device), 0
-        for i, b in enumerate(self.eval_dl):
-            if i >= self.cfg.train.eval_steps:
-                break
-            with self._autocast(), self.quant.autocast():
-                ce, _ = self.model(b["input_ids"].to(self.ctx.device), labels=b["labels"].to(self.ctx.device))
-            tot += ce.float(); n += 1
-        self.model.train()
+        dl = async_loader(self.eval_dl, self.ctx.device, depth=2) if self.cfg.train.prefetch \
+            else self.eval_dl
+        try:
+            for i, b in enumerate(dl):
+                if i >= self.cfg.train.eval_steps:
+                    break
+                with self._autocast(), self.quant.autocast():
+                    ce, _ = self.model(b["input_ids"].to(self.ctx.device),
+                                       labels=b["labels"].to(self.ctx.device))
+                tot += ce.float()
+                n += 1
+        finally:
+            if hasattr(dl, "close"):
+                dl.close()
+            self.model.train()
         return float(self.ctx.mean_over_dp(tot / max(n, 1)))
+
+    def close(self):
+        """Stop the background batch prefetcher (safe to call more than once)."""
+        feed = getattr(self, "feed", None)
+        if feed is not None:
+            feed.close()
+
+    def __del__(self):  # pragma: no cover - best effort
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------------------------------------ fit
     def fit(self):
