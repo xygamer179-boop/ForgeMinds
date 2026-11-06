@@ -681,7 +681,7 @@ seq)` warms the lazily built RoPE/grouped-GEMM tables before `torch.compile` tra
 The "bring your own architecture" surface: ordinary modules, kernel-backed where possible.
 
 ```python
-fm.nn.RMSNorm(dim, eps=1e-6, elementwise_affine=True, strict=True, device=None, dtype=None)
+fm.nn.RMSNorm(dim, eps=1e-6, elementwise_affine=True, device=None, dtype=None)
 fm.nn.SwiGLU(dim, hidden=None, bias=False, split=False, device=None, dtype=None)
 ```
 
@@ -692,8 +692,9 @@ fm.nn.SwiGLU(dim, hidden=None, bias=False, split=False, device=None, dtype=None)
 | `SwiGLU.forward(x)` | `w2(silu(w1(x)) * w3(x))`; with `split=True`, `w2(swiglu_split(gate_up(x)))` |
 | `SwiGLU.to_split(inplace=True)` | rebuild `w1\|w3` into one `gate_up` Linear; same output, new parameter names |
 
-`strict=False` skips the last-dim check (for wrappers that reshape before calling). `bias=True` is
-honoured by both variants; `to_split` raises if the two projections disagree about having a bias.
+The last-dim check is unconditional: a wrong width raises a message instead of a broadcast error
+three frames deep in torch. `bias=True` is honoured by both variants; `to_split` raises if the two
+projections disagree about having a bias.
 
 ### Trainer
 

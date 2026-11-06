@@ -167,6 +167,9 @@ def qk_norm_rope(x: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch
     ``cos``/``sin`` may be ``[T, D/2]`` or any leading-broadcast shape that flattens to
     ``T * D/2`` (the kernel indexes them as ``cos[t * D/2 + i]``).
     """
+    if x.shape[-1] % 2:
+        raise ValueError(f"qk_norm_rope rotates pairs of features, so the head dim must be even; "
+                         f"got {x.shape[-1]}")
     cos = cos.reshape(-1)[: x.shape[1] * (x.shape[-1] // 2)].reshape(x.shape[1], -1)
     sin = sin.reshape(-1)[: x.shape[1] * (x.shape[-1] // 2)].reshape(x.shape[1], -1)
     if not _ok(x, w, cos, sin):

@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import torch
 
+import forgemind as fm
 from forgemind import ForgeConfig, GPT, GPTConfig, Trainer, SyntheticLM
 from forgemind.parallel.ac import apply_activation_checkpointing
 
@@ -50,6 +51,19 @@ def test_activation_checkpointing_is_one_graph():
         e = torch._dynamo.explain(lambda t, l: m(t, labels=l))(x, y)
         assert e.graph_break_count == 0, (mode, [str(b.reason)[:200] for b in e.break_reasons])
         print(f"ac={mode}: {e.graph_count} graph, {e.graph_break_count} breaks")
+
+
+def test_activation_checkpointing_with_fused_kernels_is_one_graph():
+    """The combination the eager tests missed: AC re-runs its region in the backward, so any side
+    effect in that region (the kernel stats counter was one) becomes a graph break."""
+    for mode in ("full", "selective"):
+        m, (x, y) = _model(), _batch()
+        fm.kernels.enable(m)
+        apply_activation_checkpointing(m, mode)
+        e = torch._dynamo.explain(lambda t, l: m(t, labels=l))(x, y)
+        assert e.graph_break_count == 0, (mode, [str(b.reason)[:200] for b in e.break_reasons])
+        assert e.graph_count == 1, (mode, e.graph_count)
+        print(f"ac={mode}+fused: {e.graph_count} graph, {e.graph_break_count} breaks")
 
 
 def test_fullgraph_matches_eager():

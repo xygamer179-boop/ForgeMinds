@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 import forgemind as fm
 from forgemind import nn as fmnn
+from forgemind.kernels.apply import _is_swiglu
 
 
 def _blocks():
@@ -322,6 +323,69 @@ def test_patch_split_falls_back_when_only_one_bias_exists():
     assert fm.kernels.patch(mlp, split=True) is True
     assert torch.allclose(mlp(x), ref, atol=1e-6)
     assert not hasattr(mlp, "gate_up")           # fell back to the two-GEMM path
+
+
+def test_patch_keeps_the_eps_of_a_module_that_has_none():
+    """A module with no `eps` attribute gets 1e-6 (not torch's finfo(dtype).eps). Patching must
+    leave its numbers bit-identical -- mistaking one convention for the other moves activations
+    by ~2e-6 in fp32 before this was pinned down."""
+    class _NoEps(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(16))
+
+        def forward(self, x):
+            return F.rms_norm(x, (16,), self.weight, 1e-6)
+
+    torch.manual_seed(0)
+    norm, x = _NoEps(), torch.randn(4, 16)
+    ref = norm(x).detach().clone()
+    assert fm.kernels.patch(norm, kind="norm") is True
+    assert torch.equal(norm(x), ref)
+
+
+def test_patch_rejects_a_gate_up_pair_with_different_input_widths():
+    """`w1: 16->32`, `w3: 8->32` is not a SwiGLU this library can fuse: the one-GEMM rewrite
+    assumes both projections read the same input."""
+    mlp = _UserMLP(16, 32)
+    mlp.w3 = nn.Linear(8, 32)
+    assert _is_swiglu(mlp) is False
+    assert fm.kernels.patch(mlp) is False
+    with pytest.raises(TypeError):
+        fm.kernels.patch(mlp, kind="mlp")
+
+
+def test_split_patch_renames_parameters_so_old_checkpoints_need_mapping():
+    """Documented consequence of `split=True`: `w1`/`w3` become `gate_up`. Pin it, because a
+    silently incompatible state_dict is the kind of thing a user finds out at load time."""
+    torch.manual_seed(0)
+    mlp = _UserMLP(16, 32)
+    before = set(mlp.state_dict())
+    assert fm.kernels.patch(mlp, split=True) is True
+    after = set(mlp.state_dict())
+    assert "gate_up.weight" in after and "w1.weight" not in after
+    assert before - after == {"w1.weight", "w1.bias", "w3.weight", "w3.bias"}
+
+
+def test_forward_with_residual_rejects_a_broadcastable_but_wrong_shape():
+    """`[1, d]` would broadcast over the batch and quietly turn the residual into a no-op."""
+    norm = fmnn.RMSNorm(64)
+    x = torch.randn(4, 64)
+    for bad in (torch.randn(1, 64), torch.randn(4, 32)):
+        with pytest.raises(ValueError, match="residual shape"):
+            norm.forward_with_residual(x, bad)
+    normed, res = norm.forward_with_residual(x, torch.randn(4, 64))
+    assert normed.shape == res.shape == (4, 64)
+
+
+def test_degenerate_sizes_are_rejected():
+    """A zero-width layer is a config bug: say so at construction instead of emitting empty
+    tensors that only surface as a mysterious loss of 0.0 three steps later."""
+    with pytest.raises(ValueError, match="hidden > 0"):
+        fmnn.SwiGLU(8, 0)
+    with pytest.raises(ValueError, match="dim > 0"):
+        fmnn.RMSNorm(0)
+    assert fmnn.RMSNorm(8)(torch.randn(0, 8)).shape == (0, 8)   # empty *batch* is fine
 
 
 def test_docstring_examples_run():

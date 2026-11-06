@@ -59,7 +59,8 @@ Notes
 * Everything here works in fp32/bf16/fp16 and on CPU/CUDA/MPS. The kernels need CUDA + Triton;
   elsewhere you get the torch expression, not an error.
 * Norms are over the **last** dimension (that is what the kernel computes); ``RMSNorm(dim)``
-  checks ``x.shape[-1] == dim`` for you unless you pass ``strict=False``.
+  checks ``x.shape[-1] == dim`` and says so, because the alternative is a broadcast error from
+  three frames deep in torch.
 * Gradients are exact: ``tests/test_nn_blocks.py`` runs ``torch.autograd.gradcheck`` in float64 on
   both blocks and the functional ops, not just a forward comparison.
 * Nothing here assumes the ForgeMind ``GPT``. ``Trainer`` only needs
@@ -100,11 +101,12 @@ class RMSNorm(nn.Module):
     """
 
     def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True,
-                 strict: bool = True, device=None, dtype=None):
+                 device=None, dtype=None):
         super().__init__()
         self.dim = int(dim)
+        if self.dim <= 0:
+            raise ValueError(f"RMSNorm needs dim > 0, got {dim}")
         self.eps = float(eps)
-        self.strict = bool(strict)
         self.elementwise_affine = bool(elementwise_affine)
         if elementwise_affine:
             # same name/shape as nn.RMSNorm -> state_dict compatible in both directions
@@ -122,7 +124,7 @@ class RMSNorm(nn.Module):
         return w if w.dtype == x.dtype else w.to(x.dtype)
 
     def _check(self, x: torch.Tensor) -> None:
-        if self.strict and x.shape[-1] != self.dim:
+        if x.shape[-1] != self.dim:
             raise ValueError(f"RMSNorm({self.dim}) got a tensor with last dim {x.shape[-1]}; "
                              f"norms run over the last dimension of contiguous [..., {self.dim}]")
 
@@ -136,6 +138,11 @@ class RMSNorm(nn.Module):
         w = self._w(x)
         if residual is None:
             residual = torch.zeros_like(x)
+        elif residual.shape != x.shape:
+            # add_rms_norm would broadcast this and produce a residual stream of the wrong shape
+            # (e.g. a [1, d] residual silently expanding over the batch) -- refuse instead.
+            raise ValueError(f"residual shape {tuple(residual.shape)} does not match x "
+                             f"{tuple(x.shape)}; a residual stream must be the same shape")
         new_residual, normed = add_rms_norm(x, residual, w, self.eps)
         return normed, new_residual
 
@@ -160,6 +167,8 @@ class SwiGLU(nn.Module):
         super().__init__()
         self.dim = int(dim)
         self.hidden = int(hidden if hidden is not None else 4 * dim)
+        if self.dim <= 0 or self.hidden <= 0:
+            raise ValueError(f"SwiGLU needs dim > 0 and hidden > 0, got dim={dim}, hidden={hidden}")
         self.split = bool(split)
         kw = dict(bias=bias, device=device, dtype=dtype)
         if self.split:

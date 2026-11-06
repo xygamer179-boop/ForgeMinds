@@ -43,14 +43,24 @@ def _is_rmsnorm(m: nn.Module) -> bool:
 def _is_swiglu(m: nn.Module) -> bool:
     if not all(isinstance(getattr(m, k, None), nn.Linear) for k in ("w1", "w2", "w3")):
         return False
-    return m.w1.out_features == m.w3.out_features and m.w2.in_features == m.w1.out_features
+    # in_features must match too: with `split=True` the two weights are concatenated into one
+    # [2h, in] GEMM, and a mismatched pair would silently compute w3 on the wrong input.
+    return (m.w1.out_features == m.w3.out_features
+            and m.w1.in_features == m.w3.in_features
+            and m.w2.in_features == m.w1.out_features)
 
 
 def _patch_norm(m: nn.Module) -> None:
-    # torch's nn.RMSNorm defaults to eps=None, which means "finfo(x.dtype).eps" -- resolve it per
-    # call, otherwise patching an nn.RMSNorm would silently change its numerics for bf16.
-    eps = getattr(m, "eps", None)
-    eps = None if eps is None else float(eps)
+    # Three cases, and getting them confused silently changes the model's numbers:
+    #   * torch's nn.RMSNorm: eps is None -> finfo(x.dtype).eps, resolved per call;
+    #   * a user module with a numeric eps -> use it;
+    #   * a user module with *no* eps attribute at all -> this library's default (1e-6), not
+    #     torch's dtype epsilon. Measured drift before this distinction: 1.9e-6 per activation.
+    if not hasattr(m, "eps"):
+        eps = 1e-6                                   # our default, not torch's dtype epsilon
+    else:
+        eps = getattr(m, "eps")
+        eps = None if eps is None else float(eps)
 
     def forward(self, x):
         e = torch.finfo(x.dtype).eps if eps is None else eps
@@ -124,6 +134,10 @@ def patch(module: nn.Module, split: bool = False, kind: "str | None" = None) -> 
 
     Raises ``TypeError`` when you pass an explicit ``kind`` that the module does not satisfy --
     better than patching something whose forward would then be nonsense.
+
+    ``split=True`` **renames parameters** (``w1``/``w3`` -> ``gate_up``), so a checkpoint saved
+    before patching will not load afterwards. The epilogue-only fuse (``split=False``) keeps every
+    key and is the safe default.
     """
     if getattr(module, "_fm_norm", False) or getattr(module, "_fm_mlp", False):
         return True                       # idempotent
