@@ -2,15 +2,58 @@
 
 PyTorch training library: FSDP2/HSDP/DDP, tensor/pipeline/expert parallelism (3D), DeepSpeed ZeRO backend,
 FP8 (Transformer Engine / torchao) and INT8 training, smart gradient/activation/expert offload, MoE, packed
-Triton kernels, device autotuning, and a full trainer.
+Triton kernels, device autotuning, an asynchronous batch pipeline, and a full trainer.
+
+**Docs:** [documentation.md](documentation.md) — guide, API and config reference ·
+[PERF.md](PERF.md) — performance/sync audit · [OFFLOAD.md](OFFLOAD.md) — offload design and rejected ideas.
+
+## Install
 
 ```bash
-pip install -e .            # + torchao / transformer-engine / deepspeed as needed
+pip install -e .                 # torch>=2.6, numpy, Python >= 3.10
+pip install -e ".[kernels]"      # + triton (packed kernels)
+pip install -e ".[torchao]"      # + torchao (INT8 training, AdamW8bit)
+pip install -e ".[te]"           # + transformer-engine (FP8)
+pip install -e ".[deepspeed]"    # + deepspeed (ZeRO backend)
+pip install -e ".[test]"         # + pytest
+```
+
+Everything optional is imported lazily: `fm.kernels.available()` is `False` on a CPU box and the
+kernels fall back to torch with identical numerics.
+
+## Quick checks (from the repo root)
+
+```bash
 torchrun --nproc_per_node=4 examples/train_gpt.py --moe --dp-replicate 4 --ep 2
 torchrun --nproc_per_node=4 examples/train_gpt.py --tp 2 --dp-shard 2
-pytest tests/               # 90 tests: trainer, parallel, kernels, forge, autotune, offload
-torchrun --standalone --nproc_per_node=2 tests/mp_check.py ep_equiv   # also tp_equiv, pp_equiv, ddp, fsdp, ...
+pytest tests/               # 117 tests: trainer, parallel, kernels, forge, async batches, autotune, offload
+torchrun --standalone --nproc_per_node=2 tests/mp_check.py ep_equiv   # also ddp, fsdp, pp, tp, prefetch, ...
 ```
+
+## Trainer: the full stack from one config
+
+```python
+import forgemind as fm
+
+cfg = fm.ForgeConfig()
+cfg.train.__dict__.update(max_steps=5000, warmup_steps=200, lr=3e-4, grad_accum=4, bf16=True,
+                          log_every=10, eval_every=500, ckpt_every=500, compile=True, ac="selective")
+cfg.parallel.__dict__.update(dp_shard=8)                       # FSDP2 across 8 GPUs
+
+mc = fm.GPTConfig(vocab_size=32000, dim=1024, n_layers=24, n_heads=16, n_kv_heads=4, max_seq=2048)
+trainer = fm.Trainer(lambda ctx: fm.GPT(mc), cfg,
+                     train_ds=fm.TokenFile("train.bin", seq=2048),
+                     eval_ds=fm.TokenFile("val.bin", seq=2048),
+                     micro_batch=4, peak_flops=989e12)
+history = trainer.fit()          # logs, evals, checkpoints, resumable; returns per-step metrics
+trainer.close()
+```
+
+The model factory receives the `DistContext`, so it can size itself per rank. A dataset is any
+`torch.utils.data.Dataset` returning `{"input_ids": ..., "labels": ...}`. `train_step()` returns
+`{"step", "loss", "lr", "grad_norm", "tok_s", "dt", "skipped"}`, plus `mfu` / `mem_gb` when they
+apply — see
+[documentation.md §5.1](documentation.md#51-train-a-gpt-with-trainer).
 
 ## Your own model, two lines
 
@@ -26,7 +69,7 @@ forge.fit(loader, max_steps=1000)
 # or keep your own loop, Fabric-style:
 loss = criterion(model(**batch), batch["labels"])
 forge.backward(loss)
-forge.step()
+forge.step()          # ForgeState on an optimizer step, None while accumulating
 ```
 
 Multi-process is one decorator away (it spawns, or defers to an existing `torchrun`):
@@ -35,7 +78,7 @@ Multi-process is one decorator away (it spawns, or defers to an existing `torchr
 @fm.launch(nproc=4)
 def main():
     fm.Forge(build_model(), build_opt(), precision="bf16").fit(loader)
-main()
+main()                # module-level function; works unchanged under torchrun
 ```
 
 Mesh: world = pp * dp_replicate * dp_shard * tp; `ep` divides the DP world.
@@ -51,7 +94,7 @@ for step in range(1000):
     trainer.train_step()
 print(trainer.feed.report())     # {'wait_ms_per_batch': 0.04, 'stalled': 0, 'produce_ms': ..., 'depth': 2}
 
-# your own loop, same machinery:
+# your own loop, same machinery (any loader, any container):
 for x, y in fm.async_loader(DataLoader(ds, 64, pin_memory=True), "cuda", depth=2):
     loss = criterion(model(x), y)
 ```
@@ -61,6 +104,32 @@ strictly serial order and RNG for bit-exact comparisons, and `Trainer.close()` /
 always stop the thread (no leaked workers, no leaked CUDA streams). On a CPU-only box this is
 GIL-bound and therefore a no-op — the win is measured for the GPU-shaped case, see
 [PERF.md §8](PERF.md).
+
+Cost model: a step costs `max(load, step)` instead of `load + step` — measured 40.5 → 23.0 ms/batch
+(0.57x) when the step doesn't need the interpreter. `fm.async_loader`, `fm.to_device` and the
+dataset/sampler contract are documented in
+[documentation.md §5.4](documentation.md#54-datasets-and-loading).
+
+## Parallelism
+
+| goal | `ParallelConfig` |
+|---|---|
+| replicas (DDP) | `dp_replicate=N` |
+| sharded (FSDP2) | `dp_shard=N` |
+| hybrid sharding (HSDP) | `dp_replicate=R, dp_shard=S` |
+| tensor / pipeline / expert parallel | `tp=T`, `pp=P` (+`pp_schedule`), `ep=E` |
+| 3D | `pp=P, tp=T, dp_shard=S` |
+| DeepSpeed ZeRO | `backend="deepspeed", zero_stage=2/3` |
+
+Every layout is checked against a single-process reference:
+
+```bash
+torchrun --standalone --nproc_per_node=2 tests/mp_check.py ddp     # ddp, ddp_accum_offload, fsdp, hsdp,
+torchrun --standalone --nproc_per_node=2 tests/mp_check.py tp      # fsdp_accum, ep_ddp, pp, tp, tp_fsdp,
+torchrun --standalone --nproc_per_node=4 tests/mp_check.py 3d      # pp_fsdp, 3d, 3d_full, ep_equiv,
+torchrun --standalone --nproc_per_node=2 tests/mp_check.py prefetch # tp_equiv, pp_equiv, prefetch
+python tests/forge_mp_check.py                                     # Forge + launch across 2 processes
+```
 
 ## Packed kernels
 
@@ -75,7 +144,7 @@ kernels* through `TRITON_INTERPRET=1` on CPU (`tests/test_kernels.py`, 66 numeri
 import forgemind as fm
 y = fm.kernels.rms_norm(x, w, 1e-6)         # == F.rms_norm(x, (d,), w, eps)
 fm.kernels.enable(model)                    # or patch RMSNorm/SwiGLU modules in place
-loss = fm.kernels.kl_distill_loss(hs, ht, w, teacher_head)
+loss = fm.kernels.kl_distill_loss(hs, ht, w, teacher_head)   # teacher_head = teacher's lm_head (callable)
 ```
 
 ## Autotuning
@@ -102,23 +171,25 @@ the full audit (every stall site, every graph break, every bug, with measurement
 python -m forgemind.cli.bench --syncs --moe --experts 8        # tokens/s, p50/p90, MFU, host syncs/step
 python -m forgemind.cli.bench --compile --quant fp8 --qbackend auto
 python -m forgemind.cli.bench --profile /tmp/trace             # top ops + Perfetto/TensorBoard trace
+python -m forgemind.cli.matrix --quant none fp8 --backends auto te   # comparison table
 ```
 
 ```python
-from forgemind.perf import count_host_syncs
+from forgemind.perf import count_host_syncs, host_syncs
 
 with count_host_syncs() as c:      # audit your own step: counts + call sites, own vs torch-internal
     trainer.train_step()
-print(c.report())
+print(c.report())                  # "1 host sync(s) (1 in forgemind, 0 inside torch)" + call sites
+print(trainer.feed.report())       # batch pipeline: wait_ms_per_batch, stalled, stall_ratio, produce_ms
 ```
 
 | knob | default | effect |
 |---|---|---|
-| `TrainConfig.fused_ops` / `fused_split_mlp` | off / off | swap RMSNorm/SwiGLU for the packed kernels; `split` also fuses the gate|up GEMM |
+| `TrainConfig.fused_ops` / `fused_split_mlp` | off / off | swap RMSNorm/SwiGLU for the packed kernels; `split` also fuses the gate and up projections into one GEMM |
 | `TrainConfig.compile` / `compile_mode` / `compile_backend` / `compile_fullgraph` | off / `default` / `inductor` / off | compiles each transformer block (caches are warmed first); `fullgraph=True` refuses to fall back |
 | `TrainConfig.ac` / `ac_preserve_rng` | `none` / `False` | full or selective checkpointing; leave RNG preservation off unless you use dropout |
 | `TrainConfig.prefetch` / `workers` | `True` / `0` | overlap the next batch's H2D copy on a side stream; `workers>0` adds a DataLoader pool |
-| `TrainConfig.batch_thread` / `prefetch_depth` | auto (workers==0 or CUDA) / 2 | run the **loader** on a background thread so batch *k+1* is assembled (and copied) while step *k* computes; `False` restores bit-exact serial order. `trainer.feed.report()` shows `wait_ms_per_batch` / `stalled` |
+| `TrainConfig.batch_thread` / `prefetch_depth` | auto (workers==0 or CUDA) / 2 | run the **loader** on a background thread so batch *k+1* is assembled (and copied) while step *k* computes; `False` restores bit-exact serial order |
 | `OffloadConfig.optimizer` / `smart` / `gpu_watermark` | off / on / 0 | fp32 master + Adam states in pinned host RAM, grads streamed on a side stream |
 | `OffloadConfig.pipeline_chunks` | 4 | overlap the grad DMA of chunk *k+1* with the host Adam update of chunk *k*; `opt.report()` shows the split (see [OFFLOAD.md](OFFLOAD.md)) |
 | `OffloadConfig.activations` / `act_pool` | off / on | spill large saved activations to pinned host memory, recycling buffers |
@@ -126,11 +197,39 @@ print(c.report())
 | `GPTConfig.expert_grouped_mm` | `True` | `torch._grouped_mm` expert GEMMs (CUDA+bf16): removes the last host read from the MoE dispatch |
 | `GPTConfig.rope_high_precision` | `False` | compute the rotation in fp32 (slower, marginally more accurate) |
 | `ParallelConfig.ddp_static_graph` | `False` | skip DDP's per-iteration unused-parameter scan |
-| `fm.async_loader(loader, device, depth=2)` | -- | the same prefetcher for your own loop: `for x, y in fm.async_loader(dl, "cuda"): ...` |
+| `TrainConfig.bf16` | `True` | autocast for forward/loss; `fp16` + GradScaler is available through `Forge(precision="fp16")` |
+| `QuantConfig.mode` / `backend` / `optimizer_8bit` | `none` / `auto` / off | FP8 (TE/torchao) or INT8 (torchao) training, optional 8-bit AdamW |
+
+## Where to read what
+
+| you want | read |
+|---|---|
+| a working example for each API | [documentation.md §3–5](documentation.md#3-the-two-minute-tour) |
+| every function and its signature | [documentation.md §6](documentation.md#6-api-reference) |
+| every config field and its default | [documentation.md §7](documentation.md#7-configuration-reference) |
+| the kernel API | [documentation.md §8](documentation.md#8-kernels-reference) |
+| CLI flags (`bench`, `matrix`, `autotune`, examples, checks) | [documentation.md §9](documentation.md#9-command-line-reference) |
+| what is guaranteed, and what is *not* verified | [documentation.md §10–11](documentation.md#10-guarantees-and-invariants) |
+| an error message you just got | [documentation.md §12](documentation.md#12-troubleshooting) |
+| what each source file does | [documentation.md §13](documentation.md#13-repository-map) |
+
+## Troubleshooting (the five that actually happen)
+
+| symptom | fix |
+|---|---|
+| `BatchStream: the loader produced no batches` | dataset smaller than `micro_batch` with `drop_last=True` — shrink the batch or grow the dataset |
+| `feed.report()['stall_ratio']` is high | the loader is the bottleneck: raise `workers`, then `prefetch_depth` |
+| `pp*dp_replicate*dp_shard*tp = N != world M` | the mesh must multiply to the world size; `dp_shard=-1` fills the remainder |
+| `micro_batch must be divisible by pp_microbatches` | make `micro_batch % pp_microbatches == 0` |
+| `compile_fullgraph=True is not possible for this MoE block` | that dispatch needs a host read; use CUDA+bf16 `torch._grouped_mm`, or leave `fullgraph=False` |
+| `no trainable parameters` | everything is frozen — typical with `quant.mode="int8_wo"`; add adapters or unfreeze |
+
+The rest (quantization backends, offload+PP, empty `evaluate()`, OOM tuning) is in
+[documentation.md §12](documentation.md#12-troubleshooting).
 
 ## Status
 
-Verified on CPU/gloo (see `tests/`, 111 tests): dense/MoE training, grad accumulation, checkpoint+resume,
+Verified on CPU/gloo (see `tests/`, 117 tests): dense/MoE training, grad accumulation, checkpoint+resume,
 offload optimizer equivalence (and the chunked/pipelined path), AC modes, DDP/FSDP2/HSDP/TP/PP/3D, EP
 equivalence, `torch.compile` (`aot_eager`) with `fullgraph=True` and eager-gradient equivalence, the
 packed Triton kernels run through Triton's CPU interpreter (forward *and* backward vs torch), the
@@ -138,10 +237,9 @@ packed Triton kernels run through Triton's CPU interpreter (forward *and* backwa
 overlap, rank alignment, resume, thread/worker cleanup), and a one-host-sync-per-step budget.
 
 Untested here (no accelerator): CUDA offload streams and the pipelined overlap they enable, async H2D
-overlap and pinned-buffer reuse in the batch pipeline, kernel
-launches on real hardware (correctness is verified through the interpreter, *speed* is not), fused
-kernels under `torch.compile` on CUDA, `torch._grouped_mm` dispatch, TE/torchao FP8/INT8 training,
-DeepSpeed engine, NCCL.
+overlap and pinned-buffer reuse in the batch pipeline, kernel launches on real hardware (correctness is
+verified through the interpreter, *speed* is not), fused kernels under `torch.compile` on CUDA,
+`torch._grouped_mm` dispatch, TE/torchao FP8/INT8 training, DeepSpeed engine, NCCL.
 
 Limits: EP+FSDP2 unsupported; MoE aux loss not propagated across PP stages; experts not TP'd or quantized;
 OffloadedAdamW not for FSDP/PP; no eval under PP.
