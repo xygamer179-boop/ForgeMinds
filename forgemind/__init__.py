@@ -4,7 +4,8 @@ from .trainer import Trainer, moe_kwargs
 from .models import GPT, GPTConfig
 from .moe import MoE
 from .offload import OffloadedAdamW
-from .data import SyntheticLM, TokenFile, BatchStream, ResumableSampler, build_loader
+from .data import (SyntheticLM, TokenFile, BatchStream, ResumableSampler, build_loader,
+                   async_loader, to_device)
 from .perf import count_host_syncs, host_syncs
 from .forge import Forge, launch
 
@@ -23,6 +24,7 @@ __all__ = [
     "Trainer", "moe_kwargs",
     "GPT", "GPTConfig", "MoE", "OffloadedAdamW",
     "SyntheticLM", "TokenFile", "BatchStream", "ResumableSampler", "build_loader",
+    "async_loader", "to_device",
     "count_host_syncs", "host_syncs",
     "Forge", "launch",
 ]
