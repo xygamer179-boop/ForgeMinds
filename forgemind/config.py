@@ -75,8 +75,11 @@ class TrainConfig:
     resume: bool = True
     skip_spike_factor: float = 0.0   # >0: skip update if loss > factor * EMA(loss)
     skip_nonfinite: bool = True
-    # data pipeline: prefetch overlaps the host->device copy of batch N+1 with step N
+    # data pipeline: the background thread runs the loader while the GPU computes, and the
+    # host->device copy of the next batch overlaps the current step on a side stream
     prefetch: bool = True
+    prefetch_depth: int = 2          # batches in flight ahead of the consumer (2 = double buffer)
+    batch_thread: bool | None = None  # None = auto (workers==0 or cuda); False = serial
     workers: int = 0
     # swap RMSNorm/SwiGLU for the packed Triton kernels (needs triton + cuda; no-op otherwise)
     fused_ops: bool = False

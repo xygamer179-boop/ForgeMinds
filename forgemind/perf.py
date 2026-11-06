@@ -136,13 +136,16 @@ def host_syncs() -> int:
 
 # --------------------------------------------------------------------------------------------- misc
 _WARNED: set[str] = set()
+_WARN_LOCK = threading.Lock()
 
 
 def warn_once(msg: str, key: str | None = None) -> None:
+    """Warn at most once per key -- safe to call from the batch-prefetch thread as well."""
     key = key or msg
-    if key in _WARNED:
-        return
-    _WARNED.add(key)
+    with _WARN_LOCK:
+        if key in _WARNED:
+            return
+        _WARNED.add(key)
     import warnings
     warnings.warn(msg, stacklevel=3)
 

@@ -36,6 +36,8 @@ What it does for you
 * LR schedule (cosine with warmup by default, or pass a ``scheduler``),
 * non-finite / loss-spike skipping,
 * checkpoint save/load including optimizer, scheduler and RNG state,
+* async batches: the loader runs on a background thread and the copy to the device overlaps
+  the step, so the GPU never waits for the CPU to build a batch,
 * callbacks (``on_step``/``on_epoch``) and a history list,
 * optional optimizer offload, fused kernels and ``torch.compile``.
 
@@ -59,6 +61,8 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from .config import OffloadConfig, ParallelConfig
+from .data import async_loader as _async_loader
+from .data import to_device as _to_device
 from .distributed import cleanup, init_distributed
 from .offload import OffloadedAdamW
 from .perf import count_host_syncs, warn_once
@@ -66,6 +70,13 @@ from .perf import count_host_syncs, warn_once
 __all__ = ["Forge", "launch", "ForgeState"]
 
 _PRECISIONS = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+
+
+def _shutdown(loader):
+    """Stop a background prefetcher, if this loader has one."""
+    close = getattr(loader, "close", None)
+    if callable(close):
+        close()
 
 
 class ForgeState(dict):
@@ -76,18 +87,6 @@ class ForgeState(dict):
             return self[k]
         except KeyError as e:  # pragma: no cover
             raise AttributeError(k) from e
-
-
-def _to_device(obj, device, non_blocking=False):
-    if torch.is_tensor(obj):
-        return obj.to(device, non_blocking=non_blocking) if obj.device != device else obj
-    if isinstance(obj, dict):
-        return {k: _to_device(v, device, non_blocking) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        out = [_to_device(v, device, non_blocking) for v in obj]
-        return type(obj)(out) if isinstance(obj, tuple) and hasattr(obj, "_fields") else (
-            tuple(out) if isinstance(obj, tuple) else out)
-    return obj
 
 
 class Forge:
@@ -125,6 +124,7 @@ class Forge:
                  schedule: str | None = None, scheduler=None, compile: bool = False,
                  compile_backend: str = "inductor", compile_mode: str = "default", forward_fn=None,
                  offload: str = "none", fused_ops: bool = False, fused_split_mlp: bool = False,
+                 async_batches: bool = True, prefetch_depth: int = 2,
                  seed: int = 1234, log_every: int = 10, skip_nonfinite: bool = True,
                  skip_spike_factor: float = 0.0, callbacks=None, quiet: bool = False):
         if precision not in _PRECISIONS:
@@ -140,6 +140,8 @@ class Forge:
         # how a batch becomes a forward call: dict -> model(**batch), list/tuple -> model(*batch),
         # tensor -> model(tensor). Pass forward_fn(model, batch) for anything else.
         self.forward_fn = forward_fn
+        self.async_batches = bool(async_batches)
+        self.prefetch_depth = max(1, int(prefetch_depth))
         self.quiet = quiet
         self.log_every = max(1, int(log_every))
         self.seed = seed
@@ -334,40 +336,54 @@ class Forge:
         return self.optimizer.param_groups[0]["lr"]
 
     # ------------------------------------------------------------------ convenience loops
+    def _batches(self, loader):
+        """Batches on the device, produced on a background thread while the step computes."""
+        if not self.async_batches:
+            return loader
+        return _async_loader(loader, self.device, depth=self.prefetch_depth)
+
     def fit(self, loader, max_steps=None, epochs: int = 1):
         """Iterate ``loader`` until ``max_steps`` optimizer steps have been taken."""
+        loader = self._batches(loader)
         limit = max_steps or self.max_steps
         t0 = time.perf_counter()
         last = None
         stopped = False
-        for epoch in range(epochs):
-            for batch in loader:
-                last = self.step(batch)
-                if self.step_count >= limit:
-                    stopped = True
+        try:
+            for epoch in range(epochs):
+                for batch in loader:
+                    last = self.step(batch)
+                    if self.step_count >= limit:
+                        stopped = True
+                        break
+                    if last is not None:
+                        last = dict(last, ms=1e3 * (time.perf_counter() - t0))
+                for cb in self.callbacks:
+                    if hasattr(cb, "on_epoch"):
+                        cb.on_epoch(self, epoch)
+                if stopped:
                     break
-                if last is not None:
-                    last = dict(last, ms=1e3 * (time.perf_counter() - t0))
-            for cb in self.callbacks:
-                if hasattr(cb, "on_epoch"):
-                    cb.on_epoch(self, epoch)
-            if stopped:
-                break
+        finally:
+            _shutdown(loader)          # stop the prefetch thread, not just drop the reference
         return self.history
 
     @torch.no_grad()
     def evaluate(self, loader, max_batches: int | None = None):
+        loader = self._batches(loader)
         self.model.eval()
         total, n = 0.0, 0
-        for i, batch in enumerate(loader):
-            if max_batches is not None and i >= max_batches:
-                break
-            batch = _to_device(batch, self.device)
-            with self._autocast():
-                loss = self._extract_loss(self._call_with_batch(batch), batch)
-            total += float(loss.detach())
-            n += 1
-        self.model.train()
+        try:
+            for i, batch in enumerate(loader):
+                if max_batches is not None and i >= max_batches:
+                    break
+                batch = _to_device(batch, self.device)
+                with self._autocast():
+                    loss = self._extract_loss(self._call_with_batch(batch), batch)
+                total += float(loss.detach())
+                n += 1
+        finally:
+            _shutdown(loader)
+            self.model.train()
         return total / max(1, n)
 
     # ------------------------------------------------------------------ state

@@ -325,3 +325,119 @@ path (`chunks` 1/2/3/5, bit-exact). `opt.report()` reports the split between str
 host update so you can tell whether the link or the host is your bottleneck. The full idea list
 -- including what was rejected and why (NVMe, 8-bit moments, reduce-scatter into host memory,
 a second Adam thread) -- is in **[OFFLOAD.md](OFFLOAD.md)**.
+
+---
+
+## 8. Round three: asynchronous batches ("release the batch while the compute runs")
+
+Before this round the "prefetch" was a *staging* trick: `BatchStream.next()` copied the next batch
+to the device on a side stream, so the H2D copy overlapped the step, but **the loader itself**
+(iterate → decode/augment → collate) still ran on the main thread, between the optimizer step and
+the next forward. If a batch took 8 ms of host time, every step paid those 8 ms on the critical
+path — the accelerator sat idle while the CPU assembled data.
+
+### 8.1 What changed
+
+`forgemind/data.py` now has a producer/consumer split for both training and eval:
+
+* `BatchStream(..., threaded=True)` starts one daemon thread that owns the loader. It pulls batch
+  *k+1*, stages it (`to(device, non_blocking=True)` on the side stream, event recorded) and pushes
+  it into a `queue.Queue(maxsize=depth)`. The consumer only pops and waits on the event, so the
+  copy and the collate of batch *k+1* both happen **while step *k* is computing**.
+* `depth` (`TrainConfig.prefetch_depth`, default 2) is the number of batches allowed in flight.
+* `Trainer.evaluate()` uses the same machinery (`async_loader`, depth 2) instead of a bare
+  `for batch in dl:` loop — eval is often 10-30% of a real run.
+* `fm.async_loader(loader, device, depth=2)` exposes the same thing generically, so it is usable
+  outside this library:
+  `for x, y in fm.async_loader(DataLoader(ds, 64, pin_memory=True), "cuda"): ...`
+* `Forge(..., async_batches=True, prefetch_depth=2)` and `TrainConfig.batch_thread` are the knobs.
+  `batch_thread=None` (auto) turns the thread on when nothing else prefetches (`workers=0`) or when
+  the device is CUDA; `batch_thread=False` restores bit-exact serial order and RNG.
+
+CUDA safety, which is where a prefetcher usually goes wrong: every staged tensor has
+`record_stream(current_stream)` called on it before the producer's buffer can be reused, the
+consumer does `current_stream().wait_event(ev)`, and the producer thread calls `torch.cuda.set_device`
+on entry — `torch.cuda.set_device` is **thread-local**, so without that a rank pinned to `cuda:1`
+would allocate on `cuda:0` from the worker thread. (That was one of the bugs found, see 8.4.)
+
+### 8.2 Measured overlap
+
+Two measurements, because they answer different questions.
+
+**(a) Is the overlap real?** A loader with 20 ms of simulated host work per batch against a step
+that takes 20 ms of wall time and does not need the GIL (this is what a GPU step looks like from
+Python's point of view — the CPU is free while the kernels run):
+
+| | total | per batch |
+|---|---|---|
+| serial | 324.2 ms / 40 batches | 40.5 ms |
+| threaded, depth 2 | **184.3 ms** | **23.0 ms** (0.57x) |
+
+Producer wait 2.74 ms/batch, one stall over 40 batches. i.e. the pipeline runs at
+`max(load, step)` instead of `load + step`, which is exactly the intent.
+
+**(b) What does it cost on a CPU-only box?** No overlap is possible when *both* sides need the GIL:
+a 1 ms/sample dataset (8 ms/batch) with a 18 ms CPU step, on the real `Trainer` path, interleaved
+A/B/A/B, min of 4 rounds:
+
+| config | ms/step | vs serial |
+|---|---|---|
+| serial, `workers=0` | 18.17 | 1.00x |
+| threaded d2, `workers=0` | 18.65 | 0.97x |
+| threaded d4, `workers=0` | 18.43 | 0.99x |
+| serial, `workers=2` | 10.91 | 1.67x |
+| threaded d2, `workers=2` | 11.17 | 1.63x |
+| **auto**, `workers=0` | 17.82 | 1.02x |
+| **auto**, `workers=2` | 11.04 | 1.65x |
+
+Read this as: **the thread costs nothing and buys nothing on CPU** (all differences are inside the
+±5% noise floor; `workers=2` is 1.6x faster than `workers=0` because that is the DataLoader's own
+process pool, not this change). It buys real time only when the step lets go of the interpreter:
+
+* on CUDA, where the copy (`non_blocking=True` on a side stream) and the collate both run while the
+  kernels execute — **not verified here, no GPU in this environment**;
+* with the CPU step itself blocked on I/O (checkpoint writes, tokenizer calls that release the GIL).
+
+That is why the default is *auto* rather than always-on and why `batch_thread=False` exists: on a
+CPU box it is a no-op, and "no regression" beats "sounds faster".
+
+### 8.3 Invariants kept
+
+* **One host read per optimizer step.** The prefetch path adds no `.item()`, no
+  `cudaSynchronize`, no `torch.cuda.synchronize`: `tests/test_sync_audit.py` still counts 1, and
+  the only device→host traffic is the existing grad-norm read.
+* **Same batches, same order.** `mp_check.py prefetch` runs two ranks with `dp_replicate=2` and
+  asserts that each rank's threaded stream is *batch-for-batch identical* to its own serial stream
+  (12/12, `torch.equal`), and that both ranks consumed the same number of batches.
+* **Resume is unaffected.** `test_async_batches.py` trains 4 steps, checkpoints at 2, resumes in a
+  fresh `Trainer` with the threaded feed, and matches the uninterrupted run to 5 decimals; the
+  sampler rewind (`ResumableSampler.skip`) is unchanged.
+* **No leaks.** `close()` stops the thread, drains the queue and shuts down the DataLoader worker
+  pool (`persistent_workers=True` would otherwise keep it alive until gc), and is idempotent;
+  `Forge.fit`/`evaluate` and `Trainer.evaluate` close the stream in a `finally`, because stopping
+  early (`max_steps`, `eval_steps`) leaves the producer blocked on a full queue.
+
+### 8.4 Bugs found and fixed while doing this
+
+| # | bug | consequence |
+|---|---|---|
+| 1 | the stream re-built the batch as a raw dict instead of `(input_ids, labels)` | the step silently received the wrong tuple — the kind of bug that trains on garbage and never raises |
+| 2 | `Forge.fit()` / `evaluate()` never closed the stream when `max_steps` cut it short | a daemon thread stayed blocked on a full queue for the rest of the process |
+| 3 | `evaluate(max_batches=…)` left the producer blocked forever | same, once per eval |
+| 4 | the "empty loader" error was only raised on the serial path | with the thread on, an empty loader looked like a normal end of data |
+| 5 | a one-shot (generator) loader raised "no batches" instead of `StopIteration` | a confusing error at the end of every epoch |
+| 6 | `threaded=None` did not call `torch.cuda.set_device` on the producer thread | on a multi-GPU box every rank would have staged its batches on device 0 — OOM or silent cross-device copies |
+| 7 | `close()` did not shut down `persistent_workers` pools | one leaked worker pool per `Trainer.evaluate()` call with `workers>0` |
+| 8 | `async_loader.close()` neither drained nor marked itself closed | `next()` after `close()` returned a stale batch instead of stopping |
+| 9 | `warn_once` mutated a module-level set from the producer thread | a race could print the same warning twice (benign, but it is now lock-guarded) |
+| 10 | an empty loader with a known length was only detected on the first `next()` | a `drop_last` misconfiguration surfaced mid-step instead of at construction |
+| 11 | `TokenFile` never released its memmap | the file stayed mapped (and un-deletable on Windows) after the trainer was gone |
+| 12 | the auto policy enabled the thread even when worker processes already prefetch | second hand-off for nothing; auto now keys off "does anything else prefetch" |
+
+### 8.5 What is *not* verified
+
+The CUDA half: async copy overlap, `record_stream` correctness under memory pressure, and the
+multi-GPU device binding are written and reasoned about, and the CPU paths that exercise the same
+code are tested, but there is no accelerator in this environment. Treat the GPU speedup as
+**unmeasured** — measure it with `trainer.feed.report()`, which returns
+`wait_ms_per_batch`, `stalled`, `stall_ratio` and `produce_ms` for exactly this purpose.
