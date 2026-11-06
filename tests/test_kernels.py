@@ -183,6 +183,40 @@ def test_forced_fallback_is_used_even_on_cuda():
     assert kernels.stats()["reasons"].get("backend=fallback") == 1
 
 
+def test_stats_are_not_counted_inside_a_graph():
+    """The counters are a debugging aid, so they must not become a tracing side effect: mutating
+    a module-level dict while dynamo traces is what broke `ac` + `fused_ops` (activation
+    checkpointing re-runs the region in the backward, and the re-run cannot be captured)."""
+    kernels.set_backend("auto")
+    kernels.reset_stats()
+    w, x = torch.randn(8), torch.randn(4, 8)
+    fn = torch.compile(lambda t: kernels.rms_norm(t, w, 1e-6),
+                       backend="aot_eager", fullgraph=True)
+    before = kernels.stats()
+    fn(x)
+    assert kernels.stats() == before, "a traced call must not touch the stats dict"
+
+
+def test_stats_still_count_eager_calls():
+    kernels.reset_stats()
+    kernels.rms_norm(torch.randn(4, 8), torch.randn(8), 1e-6)
+    st = kernels.stats()
+    assert st["fast"] + st["fallback"] == 1
+
+
+def test_swiglu_split_rejects_an_odd_last_dim():
+    """`gate|up` needs a paired width; slicing 127 into 63+64 would be silently lopsided."""
+    with pytest.raises(ValueError, match="even last dimension"):
+        kernels.swiglu_split(torch.randn(4, 127))
+
+
+def test_qk_norm_rope_rejects_an_odd_head_dim():
+    """RoPE rotates feature pairs, so an odd head dim is not representable."""
+    with pytest.raises(ValueError, match="must be even"):
+        kernels.qk_norm_rope(torch.randn(1, 8, 4, 63), torch.randn(63),
+                             torch.randn(8, 32), torch.randn(8, 32))
+
+
 # ---------------------------------------------------------------- model wiring
 def test_enable_is_numerically_transparent():
     from forgemind.models import GPT, GPTConfig

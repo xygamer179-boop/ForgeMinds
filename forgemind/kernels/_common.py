@@ -72,7 +72,25 @@ def triton_available() -> bool:
     return HAS_TRITON and not (triton is None)
 
 
+def tracing() -> bool:
+    """True while ``torch.compile`` is tracing this code."""
+    try:
+        return torch.compiler.is_compiling()
+    except Exception:  # pragma: no cover - torch without the API
+        return False
+
+
 def _note(why: str) -> None:
+    """Record *why* the torch path was taken -- but never mutate state while tracing.
+
+    This counter used to run unconditionally, and that single dict update is enough to make
+    Dynamo give up when the call happens inside a checkpointed region: activation checkpointing
+    re-runs the region in the backward, and Dynamo will not trace a side effect it would have to
+    apply twice. Measured cost of not having this guard: ``ac=selective + fused_ops`` went from
+    1 graph / 0 breaks to 2 graphs / 1 break (PERF.md 9.2). Diagnostics are not worth a graph.
+    """
+    if tracing():
+        return
     _STATS["fallback"] += 1
     _STATS["reason"][why] = _STATS["reason"].get(why, 0) + 1
 
@@ -95,7 +113,8 @@ def fast_ok(*tensors) -> bool:
             if t.dtype not in (torch.float32, torch.float16, torch.bfloat16):
                 _note(f"dtype {t.dtype}")
                 return False
-    _STATS["fast"] += 1
+    if not tracing():
+        _STATS["fast"] += 1
     return True
 
 

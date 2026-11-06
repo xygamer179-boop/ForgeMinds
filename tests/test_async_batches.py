@@ -6,7 +6,6 @@ test measures wall time against the serial baseline, because "it has a thread" i
 as "it overlaps".
 """
 
-import gc
 import threading
 import time
 
@@ -344,7 +343,11 @@ def test_resume_after_checkpoint_is_exact_with_the_threaded_feed(tmp_path):
 
 def test_loader_workers_use_persistent_pool():
     """workers>0 with persistent_workers: the pool survives epoch rollovers (no fork on the
-    prefetch thread, which is what makes the threaded stream safe)."""
+    prefetch thread, which is what makes the threaded stream safe) and close() frees it.
+
+    The assertion is on the worker *processes*: multiprocessing's own queue-feeder threads exit
+    asynchronously at collection time, so counting threads here would be a racy test, not a bug.
+    """
     from forgemind import SyntheticLM, build_loader
 
     class Ctx:
@@ -354,14 +357,15 @@ def test_loader_workers_use_persistent_pool():
     ds = SyntheticLM(64, 8, n=64)
     dl, sampler = build_loader(ds, 4, Ctx(), workers=2)
     assert dl.persistent_workers is True
-    names_before = {t.name for t in threading.enumerate()}
     stream = BatchStream(dl, sampler, torch.device("cpu"), threaded=True, depth=2)
-    seen = [int(stream.next()[0].flatten()[0]) for _ in range(10)]   # crosses an epoch
-    stream.close()
+    workers = list(getattr(stream._it, "_workers", []))
+    assert workers, "expected a worker pool"
+    seen = [int(stream.next()[0].flatten()[0]) for _ in range(10)]   # crosses an epoch boundary
     assert len(seen) == 10
-    gc.collect()   # queue-feeder threads of multiprocessing.Queue exit at collection time
-    leaked = {t.name for t in threading.enumerate()} - names_before - {"forgemind-batches"}
-    assert not leaked
+    assert all(w.is_alive() for w in workers), "persistent_workers should survive the epoch"
+    stream.close()
+    assert all(not w.is_alive() for w in workers), "close() must terminate the worker pool"
+    assert not [t for t in threading.enumerate() if t.name == "forgemind-batches"]
 
 
 def test_async_loader_releases_worker_processes_on_close():

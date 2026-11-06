@@ -311,8 +311,10 @@ class Trainer:
 
         dt = time.perf_counter() - t0
         toks = self.micro_batch * (self.seq or 0) * tc.grad_accum * self.ctx.dp_world
-        m = {"step": self.step + 1, "loss": lv, "lr": lr, "grad_norm": gn_v, "tok_s": toks / dt, "dt": dt,
+        m = {"step": self.step + 1, "loss": lv, "lr": lr, "grad_norm": gn_v, "dt": dt,
              "skipped": self.skipped}
+        if self.seq:            # a model without `cfg.max_seq` has no token count -- report nothing
+            m["tok_s"] = toks / dt
         if self.peak_flops and hasattr(self.raw, "flops_per_token") and self.seq:
             m["mfu"] = toks * self.raw.flops_per_token(self.seq) / dt / (self.peak_flops * self.ctx.world)
         if self.ctx.device.type == "cuda":
@@ -372,8 +374,9 @@ class Trainer:
             if self.step % tc.log_every == 0 or self.step == 1:
                 extra = f" mfu {m['mfu']*100:.1f}%" if "mfu" in m else ""
                 extra += f" mem {m['mem_gb']:.1f}G" if "mem_gb" in m else ""
+                tps = f"{m['tok_s']:,.0f} tok/s | " if "tok_s" in m else ""
                 log(ctx, f"step {m['step']:>6} | loss {m['loss']:.4f} | lr {m['lr']:.2e} | gnorm {m['grad_norm']:.2f} | "
-                         f"{m['tok_s']:,.0f} tok/s | {m['dt']*1000:.0f} ms{extra}" + (f" | skipped {self.skipped}" if self.skipped else ""))
+                         f"{tps}{m['dt']*1000:.0f} ms{extra}" + (f" | skipped {self.skipped}" if self.skipped else ""))
             if tc.eval_every and self.step % tc.eval_every == 0:
                 ev = self.evaluate()
                 if ev is not None:

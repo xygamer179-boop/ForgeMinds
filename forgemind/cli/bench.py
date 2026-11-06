@@ -120,7 +120,7 @@ def main(argv=None):
             sync_counter = sync_cm.__enter__()
         m = tr.train_step()
         if i >= a.warmup:
-            times.append(m["dt"]); toks.append(m["tok_s"]); losses.append(m["loss"])
+            times.append(m["dt"]); toks.append(m.get("tok_s", 0.0)); losses.append(m["loss"])
         if prof is not None:
             if ctx.device.type == "cuda":
                 torch.cuda.synchronize()

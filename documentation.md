@@ -1,6 +1,6 @@
 # ForgeMind documentation
 
-Reference and guide for **forgemind 0.4.0** — a PyTorch training library with FSDP2/HSDP/DDP,
+Reference and guide for **forgemind 0.5.0** — a PyTorch training library with FSDP2/HSDP/DDP,
 tensor/pipeline/expert parallelism, DeepSpeed ZeRO, FP8/INT8 quantized training, gradient /
 activation / expert offload, MoE, packed Triton kernels, device autotuning, an asynchronous batch
 pipeline, and two levels of trainer API.
@@ -25,16 +25,17 @@ and why) is in [OFFLOAD.md](OFFLOAD.md).
 5. [Guides](#5-guides)
    - [5.1 Train a GPT with `Trainer`](#51-train-a-gpt-with-trainer)
    - [5.2 Bring your own model with `Forge`](#52-bring-your-own-model-with-forge)
-   - [5.3 Your own loop, Fabric-style](#53-your-own-loop-fabric-style)
-   - [5.4 Datasets and loading](#54-datasets-and-loading)
-   - [5.5 Multi-GPU: layouts and how to prove them](#55-multi-gpu-layouts-and-how-to-prove-them)
-   - [5.6 Memory: activation checkpointing and offload](#56-memory-activation-checkpointing-and-offload)
-   - [5.7 Precision and quantized training](#57-precision-and-quantized-training)
-   - [5.8 Mixture of experts](#58-mixture-of-experts)
-   - [5.9 Speed: compile, fused kernels, autotune, prefetch](#59-speed-compile-fused-kernels-autotune-prefetch)
-   - [5.10 Checkpoint and resume](#510-checkpoint-and-resume)
-   - [5.11 Evaluation](#511-evaluation)
-   - [5.12 Measuring](#512-measuring)
+   - [5.3 Bring your own architecture](#53-bring-your-own-architecture)
+   - [5.4 Your own loop, Fabric-style](#54-your-own-loop-fabric-style)
+   - [5.5 Datasets and loading](#55-datasets-and-loading)
+   - [5.6 Multi-GPU: layouts and how to prove them](#56-multi-gpu-layouts-and-how-to-prove-them)
+   - [5.7 Memory: activation checkpointing and offload](#57-memory-activation-checkpointing-and-offload)
+   - [5.8 Precision and quantized training](#58-precision-and-quantized-training)
+   - [5.9 Mixture of experts](#59-mixture-of-experts)
+   - [5.10 Speed: compile, fused kernels, autotune, prefetch](#510-speed-compile-fused-kernels-autotune-prefetch)
+   - [5.11 Checkpoint and resume](#511-checkpoint-and-resume)
+   - [5.12 Evaluation](#512-evaluation)
+   - [5.13 Measuring](#513-measuring)
 6. [API reference](#6-api-reference)
 7. [Configuration reference](#7-configuration-reference)
 8. [Kernels reference](#8-kernels-reference)
@@ -56,7 +57,7 @@ Two ways in, same guarantees underneath:
 | `fm.Forge` | any `nn.Module`, any `DataLoader`, any loss | Lightning/Fabric-style `fit()` / `step()` / `backward()`, with the same one-sync-per-step and clipping discipline |
 
 What the library deliberately optimises for: **the accelerator should never wait on the host.**
-That shows up as three concrete budgets you can check yourself ([§5.12](#512-measuring)):
+That shows up as three concrete budgets you can check yourself ([§5.13](#513-measuring)):
 
 * exactly **one host↔device synchronisation per optimizer step** (grad-norm + loss + skip flag
   stacked into a single `.tolist()`);
@@ -98,7 +99,7 @@ mc = fm.GPTConfig(vocab_size=32000, dim=768, n_layers=12, n_heads=12, n_kv_heads
 trainer = fm.Trainer(lambda ctx: fm.GPT(mc), cfg, train_ds, eval_ds=val_ds, micro_batch=8)
 history = trainer.fit()
 
-print(history[-1]["loss"], history[-1]["tok_s"])
+print(history[-1]["loss"], history[-1].get("tok_s"))    # tok_s needs model.cfg.max_seq
 trainer.close()
 ```
 
@@ -202,7 +203,8 @@ step      1 | loss 4.1672 | lr 1.00e-03 | gnorm 1.24 | 16,494 tok/s | 31 ms mfu 
 ```
 
 `mesh(...)` is the actual layout (a mistyped flag shows up here immediately), `params(local)` counts
-this rank only, and `tok_s` is per-optimizer-step throughput across the DP world. `mfu` appears when
+this rank only, and `tok_s` is per-optimizer-step throughput across the DP world (the column is
+omitted for a model with no `cfg.max_seq`). `mfu` appears when
 `peak_flops` is passed to `Trainer`; `mem_gb` is `cuda.max_memory_allocated()`.
 
 ---
@@ -243,7 +245,7 @@ Run it under `torchrun --nproc_per_node=8 your_script.py`. The model factory rec
 | `loss` | mean cross-entropy over the accumulation window (DP/PP reduced) |
 | `lr` | learning rate used |
 | `grad_norm` | norm *before* clipping (EP/PP aware) |
-| `tok_s` | tokens/second: `micro_batch * seq * grad_accum * dp_world / dt` |
+| `tok_s` | tokens/second: `micro_batch * seq * grad_accum * dp_world / dt`; only present when the model exposes `cfg.max_seq` |
 | `dt` | seconds for this step |
 | `skipped` | cumulative count of skipped updates (non-finite or spike) |
 | `mfu`, `mem_gb` | only when `peak_flops` is given / on CUDA |
@@ -287,7 +289,124 @@ used, and a tuple/list uses its first tensor.
 Nothing in `Forge` assumes a transformer, a tokenizer, or a schedule: `max_steps`, `warmup` and
 `min_lr_ratio` only shape the built-in cosine LR (pass `scheduler=` or `schedule=None` to take over).
 
-### 5.3 Your own loop, Fabric-style
+### 5.3 Bring your own architecture
+
+ForgeMind is an extension, not a framework. `GPT`, `Trainer` and `Forge` are conveniences layered
+on top of parts you can take individually — and nothing in this section needs any of them.
+
+**One kernel, as a function.** The lowest level takes tensors and returns tensors:
+
+```python
+import forgemind as fm
+
+y = fm.kernels.rms_norm(x, w, eps=1e-6)          # == F.rms_norm(x, (d,), w, eps)
+y = fm.kernels.swiglu(gate, up)                  # == F.silu(gate) * up
+y = fm.kernels.swiglu_split(x)                   # == silu(x[..., :h]) * x[..., h:]
+xn, y = fm.kernels.add_rms_norm(x, delta, w)     # residual + norm in one pass: (x+delta, normed)
+y = fm.kernels.qk_norm_rope(q, w, cos, sin)      # per-head RMSNorm + RoPE, x is [B,T,H,D]
+loss = fm.kernels.kl_distill_loss(hs, ht, w, teacher_head)
+```
+
+Every one is differentiable (custom `Function`, exact gradients, `gradcheck`ed for the blocks),
+keeps the input dtype, and **is the torch expression when Triton is not available** — so the same
+line of code runs on CPU, MPS and CUDA.
+
+**One block, as a module.** `fm.nn` holds the two building blocks most architectures need, as
+ordinary `nn.Module`s you can put inside your own model:
+
+```python
+from forgemind import nn as fmnn
+import torch, torch.nn as nn
+
+class MyBlock(nn.Module):
+    def __init__(self, dim, hidden):
+        super().__init__()
+        self.norm = fmnn.RMSNorm(dim)             # fused RMSNorm
+        self.mlp = fmnn.SwiGLU(dim, hidden)       # w2(silu(w1 x) * w3 x), fused epilogue
+
+    def forward(self, h):
+        h = h + self.mlp(self.norm(h))
+        return h
+```
+
+* `fmnn.RMSNorm` is a drop-in for `torch.nn.RMSNorm`: same `weight` parameter, so an existing
+  checkpoint loads straight into it and back out. It also keeps torch's `eps=None` semantics
+  (`finfo(dtype).eps`) instead of quietly substituting `1e-6`.
+* `fmnn.RMSNorm.forward_with_residual(x, residual)` returns `(normed, x + residual)`, writing the
+  residual stream once — the pre-norm fusion that saves a full round trip of the hidden state.
+* `fmnn.SwiGLU(..., split=True)` (or `.to_split()`) concatenates the gate and up projections into
+  one `gate_up` GEMM and uses the fused `swiglu_split` epilogue: one launch and one weight stream
+  instead of two. It is numerically identical; only the parameter names change, which is why it is
+  opt-in.
+
+**Your own module, fused in place.** When you already have the class you want, fuse it rather than
+rewrite it:
+
+```python
+fm.kernels.patch(model.norm)                 # name looks like a norm, 1-D weight + eps
+fm.kernels.patch(model.scale, kind="norm")   # my class is called `Scale`: say what it is
+fm.kernels.patch(model.mlp)                  # w1/w2/w3 Linears -> fused SwiGLU epilogue
+fm.kernels.patch(model.mlp, split=True)      # ...and one gate|up GEMM
+```
+
+| call | what it fuses | refuses when |
+|---|---|---|
+| `patch(m)` / `patch(m, kind="norm")` | `forward` becomes `rms_norm(x, m.weight, m.eps)` | no 1-D `weight` Parameter (`kind="norm"` raises `TypeError`) |
+| `patch(m)` / `patch(m, kind="mlp")` | `w2(silu(w1 x) * w3 x)` with the packed epilogue | no `w1`/`w2`/`w3` Linear layout |
+| `patch(m, split=True)` | also rebuilds `w1\|w3` into one `gate_up` Linear | the two biases differ, or the shapes do not match (falls back to the epilogue-only fuse) |
+
+`patch` returns `True` when it recognised the module and `False` when it did not, so a wrong guess
+fails at the call site: `assert fm.kernels.patch(model.norm)`. It is idempotent, it works on
+**torch's own** classes (`patch(nn.RMSNorm(768))`), and it preserves biases — a fused gate|up GEMM
+carries both.
+
+**Training it.** `Trainer` takes any model factory; it never looks inside the model. The contract:
+
+| you provide | required? | used for |
+|---|---|---|
+| `model(tokens, labels=None) -> (ce, aux)` | yes | the training step; `aux` is an extra loss or `None` |
+| `model.cfg.max_seq` | no | tokens/s |
+| `model.prepare(device, dtype, seq)` | no | warming lazily built tables before `torch.compile` |
+| `model.split_stage(rank, n_stages)` | only for `pp > 1` | pipeline partitioning |
+| `model.flops_per_token(seq)` | no | MFU when `peak_flops` is given |
+
+```python
+class MyLM(nn.Module):
+    def __init__(self, vocab, dim):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, dim)
+        self.blocks = nn.ModuleList([MyBlock(dim, 4 * dim) for _ in range(4)])
+        self.head = nn.Linear(dim, vocab)
+
+    def forward(self, tokens, labels=None):
+        h = self.emb(tokens)
+        for b in self.blocks:
+            h = b(h)
+        logits = self.head(h)
+        if labels is None:
+            return logits, None
+        return nn.functional.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]), labels.reshape(-1)), None
+
+trainer = fm.Trainer(lambda ctx: MyLM(32000, 768), cfg, train_ds, micro_batch=8)
+trainer.fit()
+```
+
+DDP/FSDP2, gradient accumulation, activation checkpointing, `torch.compile`, offload, the async
+batch pipeline, checkpoints and the one-sync-per-step budget all apply unchanged. What still needs
+this repo's model is **TP** (`apply_tp` rewrites the attention/MLP naming it knows), **PP** (needs
+`split_stage`) and **EP** (needs `MoE`).
+
+**Same numbers, both paths.** Every block delegates to `fm.kernels`, which falls back to torch when
+Triton or CUDA is missing:
+
+```python
+fm.kernels.available()             # False on CPU (the torch expression is used, not an error)
+fm.kernels.set_backend("fallback") # force the torch path to A/B your own change
+fm.kernels.stats()                 # which path ran, and how often
+```
+
+### 5.4 Your own loop, Fabric-style
 
 ```python
 forge = fm.Forge(model, opt, precision="bf16", accum=8, quiet=True)
@@ -321,7 +440,7 @@ if __name__ == "__main__":
 `WORLD_SIZE > 1` is already in the environment, so the same script works under `torchrun`.
 The decorated function must be **module-level** (it has to be picklable).
 
-### 5.4 Datasets and loading
+### 5.5 Datasets and loading
 
 The `Trainer` contract is a `torch.utils.data.Dataset` whose `__getitem__` returns a dict with
 `input_ids` and `labels`:
@@ -347,7 +466,7 @@ Rolling your own loader for `Forge` is free-form: anything iterable of tensors/d
 stream, so the batch sequence after a resume is the batch sequence of an uninterrupted run — asserted
 to 5 decimals in `tests/test_async_batches.py`.
 
-### 5.5 Multi-GPU: layouts and how to prove them
+### 5.6 Multi-GPU: layouts and how to prove them
 
 | goal | `ParallelConfig` |
 |---|---|
@@ -377,7 +496,7 @@ Full scenario list: `ddp`, `ddp_accum_offload`, `fsdp`, `hsdp`, `fsdp_accum`, `e
 `pp`, `tp`, `tp_fsdp`, `pp_fsdp`, `3d`, `3d_full`, `ep_equiv`, `tp_equiv`, `pp_equiv`, `prefetch`.
 Each prints a `RESULT ...` line and exits non-zero on mismatch.
 
-### 5.6 Memory: activation checkpointing and offload
+### 5.7 Memory: activation checkpointing and offload
 
 ```python
 cfg.train.ac = "full"              # "none" | "full" | "selective"
@@ -401,7 +520,7 @@ Rules that will bite if ignored: optimizer offload is not supported together wit
 parallelism (and not with FSDP/PP — see [OFFLOAD.md](OFFLOAD.md)), and `act_layers` counts blocks
 from the front, so `0.5` means "the first half".
 
-### 5.7 Precision and quantized training
+### 5.8 Precision and quantized training
 
 ```python
 cfg.train.bf16 = True              # autocast context around forward/loss (CPU included, for tests)
@@ -417,7 +536,7 @@ cfg.quant.optimizer_8bit = True    # torchao AdamW8bit
   `no trainable parameters`, by design.
 * `QuantConfig.exclude` keeps `lm_head`, `gate`, `router`, `tok_emb` out of quantization.
 
-### 5.8 Mixture of experts
+### 5.9 Mixture of experts
 
 ```python
 mc = fm.GPTConfig(vocab_size=32000, dim=1024, n_layers=12, n_heads=16, n_kv_heads=4, max_seq=2048,
@@ -437,7 +556,7 @@ deliberate graph break**, which `compile_fullgraph=True` will refuse (with an ex
 Known limits: experts are not TP'd or quantized, the aux loss is not propagated across pipeline
 stages (a warning is logged at construction), and EP+FSDP2 is unsupported.
 
-### 5.9 Speed: compile, fused kernels, autotune, prefetch
+### 5.10 Speed: compile, fused kernels, autotune, prefetch
 
 ```python
 cfg.train.compile = True
@@ -469,7 +588,7 @@ Batches are scored by **per-sample** cost: a bigger micro-batch usually costs th
 step-time scoring picks the smallest batch that fits. `python -m forgemind.autotune --kernels` sweeps
 Triton launch configurations instead.
 
-### 5.10 Checkpoint and resume
+### 5.11 Checkpoint and resume
 
 `Trainer` (sharded, distributed-checkpoint format):
 
@@ -492,7 +611,7 @@ forge.save("ckpt.pt")     # model, optimizer, scheduler, step, ema_loss, RNG sta
 forge.load("ckpt.pt")
 ```
 
-### 5.11 Evaluation
+### 5.12 Evaluation
 
 ```python
 cfg.train.eval_every = 500      # call evaluate() every N steps from fit()
@@ -506,7 +625,7 @@ loss over the DP group. It returns `None` (with no exception) when there is no `
 `pp > 1`, or on the DeepSpeed backend — those combinations are not implemented. `Forge.evaluate()`
 takes `max_batches=` and computes the mean of your `loss_fn`.
 
-### 5.12 Measuring
+### 5.13 Measuring
 
 ```bash
 python -m forgemind.cli.bench --syncs --moe --experts 8        # tok/s, p50/p90, MFU, syncs/step
@@ -556,6 +675,26 @@ fm.moe_kwargs(ctx, cfg) -> dict
 `GPT(tokens, labels=None) -> (ce, aux)`; `aux` is the MoE aux/z loss or `None`.
 `GPT.split_stage(pp_rank, n_stages)` is what pipeline parallelism calls; `GPT.prepare(device, dtype,
 seq)` warms the lazily built RoPE/grouped-GEMM tables before `torch.compile` traces the model.
+
+### Composable blocks (`fm.nn`)
+
+The "bring your own architecture" surface: ordinary modules, kernel-backed where possible.
+
+```python
+fm.nn.RMSNorm(dim, eps=1e-6, elementwise_affine=True, device=None, dtype=None)
+fm.nn.SwiGLU(dim, hidden=None, bias=False, split=False, device=None, dtype=None)
+```
+
+| member | description |
+|---|---|
+| `RMSNorm.forward(x)` | `x / sqrt(mean(x**2) + eps) * weight` over the last dim; `state_dict` compatible with `nn.RMSNorm` (parameter `weight`); output dtype is the input dtype |
+| `RMSNorm.forward_with_residual(x, residual=None)` | returns `(normed, x + residual)`, writing the residual stream once |
+| `SwiGLU.forward(x)` | `w2(silu(w1(x)) * w3(x))`; with `split=True`, `w2(swiglu_split(gate_up(x)))` |
+| `SwiGLU.to_split(inplace=True)` | rebuild `w1\|w3` into one `gate_up` Linear; same output, new parameter names |
+
+The last-dim check is unconditional: a wrong width raises a message instead of a broadcast error
+three frames deep in torch. `bias=True` is honoured by both variants; `to_split` raises if the two
+projections disagree about having a bias.
 
 ### Trainer
 
@@ -761,7 +900,8 @@ fm.kernels.kl_distill_loss(hs, ht, w, teacher_head, chunk=4096)   # KL on logits
 fm.kernels.kl_div_logits(student, teacher, reduction="mean", grad_dtype=None)
 fm.kernels.kl_div(student, teacher, reduction="mean", grad_dtype=None)
 
-fm.kernels.enable(model, norm=True, swiglu_mlp=True, split=False)  # patch modules in place
+fm.kernels.enable(model, norm=True, swiglu_mlp=True, split=False)  # patch a whole tree in place
+fm.kernels.patch(module, split=False, kind=None) -> bool     # one module; False = not recognised
 fm.kernels.available() -> bool
 fm.kernels.set_backend("auto" | "fallback" | "triton")
 fm.kernels.get_backend() / fm.kernels.stats()
@@ -849,7 +989,7 @@ These are enforced by tests, not just intentions.
 
 ## 11. Verified vs not verified
 
-Verified on CPU/gloo in this repository (`pytest tests/`, 117 tests):
+Verified on CPU/gloo in this repository (`pytest tests/`, 140 tests):
 
 * dense and MoE training, gradient accumulation, checkpoint + resume;
 * `OffloadedAdamW` equivalence including the chunked/pipelined path, activation offload;
@@ -914,7 +1054,8 @@ PP stages; experts not TP'd or quantized; optimizer offload not for FSDP/PP; no 
 | `forgemind/quant.py` | quantized training (TE fp8, torchao int8) and the 8-bit optimizer |
 | `forgemind/offload.py` | `OffloadedAdamW`, activation offload, pinned buffer pooling |
 | `forgemind/perf.py` | host-sync counting, `warn_once`, fast-math defaults, pinned pool |
-| `forgemind/kernels/` | Triton kernels, torch fallbacks, `apply.enable()` |
+| `forgemind/kernels/` | Triton kernels, torch fallbacks, `apply.patch()` / `apply.enable()` |
+| `forgemind/nn.py` | composable blocks: `RMSNorm` (with fused residual), `SwiGLU` (dense or fused gate\|up) |
 | `forgemind/autotune.py` | `apply_fast_defaults`, `tune_batch_size`, `autotune`, kernel sweep |
 | `forgemind/distributed.py`, `forgemind/loss.py` | mesh/groups init, chunked CE/KL losses |
 | `forgemind/cli/` | `bench.py`, `matrix.py`, `__main__` |
@@ -927,5 +1068,6 @@ PP stages; experts not TP'd or quantized; optimizer offload not for FSDP/PP; no 
 Test files by concern: `test_single.py` (trainer basics), `test_edge_cases.py`, `test_sync_audit.py`
 (sync budget), `test_compile.py` (graph breaks), `test_forge.py`, `test_async_batches.py` (data
 pipeline), `test_offload.py`, `test_kernels.py`, `test_autotune.py`, `test_ds_config.py`
-(DeepSpeed config generation), `test_docs.py` (these documents: every documented `fm.*` name must
+(DeepSpeed config generation), `test_nn_blocks.py` (the blocks and `patch` are drop-in
+compatible with torch, differentiable, and trainable in a hand-written model), `test_docs.py` (these documents: every documented `fm.*` name must
 exist, every anchor must resolve, every config field must be documented).

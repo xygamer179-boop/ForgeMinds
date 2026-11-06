@@ -197,7 +197,9 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 def swiglu_split(x: torch.Tensor) -> torch.Tensor:
     """``silu(x[..., :h]) * x[..., h:]`` for a fused gate|up projection ``[..., 2h]``."""
-    if x.shape[-1] % 2 or not x.is_contiguous() or x.numel() >= 2 ** 31 or not fast_ok(x):
+    if x.shape[-1] % 2:
+        raise ValueError(f"swiglu_split needs an even last dimension (gate|up), got {x.shape[-1]}")
+    if not x.is_contiguous() or x.numel() >= 2 ** 31 or not fast_ok(x):
         h = x.shape[-1] // 2
         return (torch.nn.functional.silu(x[..., :h].float()) * x[..., h:].float()).to(x.dtype)
     return _SwiGLUSplitFn.apply(x)
