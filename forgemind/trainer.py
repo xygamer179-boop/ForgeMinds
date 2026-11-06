@@ -17,6 +17,7 @@ from .config import ForgeConfig
 from .distributed import init_distributed, DistContext, log
 from .data import build_loader, BatchStream
 from .loss import logits_cross_entropy
+from .kernels import available as kernels_available
 from .offload import OffloadedAdamW, apply_activation_offload
 from .perf import warn_once, enable_fast_math
 from .quant import quantize_model, make_optimizer_8bit, QuantState
@@ -79,6 +80,12 @@ class Trainer:
         if oc.activations and ctx.device.type == "cuda":
             apply_activation_offload(model, oc)
         self.model = model
+        if getattr(tc, "fused_ops", False):
+            from .kernels.apply import enable as _enable_kernels
+            info = _enable_kernels(model, norm=True, swiglu_mlp=True,
+                                   split=getattr(tc, "fused_split_mlp", False))._fm_fused
+            warn_once(f"[forgemind] fused kernels patched {info['norm']} norm / {info['mlp']} MLP "
+                      f"modules (triton={kernels_available()})", key="fused_ops")
         self._warm_caches(model, tc.bf16)
         if tc.compile:
             self._compile_blocks(model, tc)

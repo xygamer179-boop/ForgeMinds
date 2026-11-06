@@ -59,6 +59,18 @@ class OffloadedAdamW:
         self._filled: set = set()     # params whose accumulator already holds a value
         self._pending: list = []      # (param, host buffer) copies still in flight
         self._pressure = 0.0
+        # pipelined step: chunk the params so the host update of chunk k overlaps the DMA of k+1
+        self._chunks = max(1, int(getattr(self.cfg, "pipeline_chunks", 4)))
+        self._chunk_of = {}
+        self._events = None
+        # instrumentation (see `report()`): bytes moved and DMA ops issued
+        self.stats = {"d2h_bytes": 0, "d2h_ops": 0, "h2d_bytes": 0, "h2d_ops": 0,
+                      "syncs": 0, "host_update_ms": 0.0, "stream_ms": 0.0}
+
+        for i, p in enumerate(self.params):
+            self._chunk_of[p] = i % self._chunks
+        if self.cuda:
+            self._events = [torch.cuda.Event() for _ in range(self._chunks)]
 
         groups = []
         for g in param_groups:
@@ -124,6 +136,9 @@ class OffloadedAdamW:
             g.record_stream(self.stream)
             self._filled.add(p)
             self._pending.append((p, None))
+            self._mark_done(p)
+            self.stats["d2h_ops"] += 1
+            self.stats["d2h_bytes"] += g.numel() * g.element_size()
         else:
             buf = self._staging_buf(p, g.dtype)
             self.stream.wait_stream(cur)
@@ -131,6 +146,19 @@ class OffloadedAdamW:
                 buf.copy_(g, non_blocking=True)
             g.record_stream(self.stream)
             self._pending.append((p, buf))
+            self._mark_done(p)
+            self.stats["d2h_ops"] += 1
+            self.stats["d2h_bytes"] += g.numel() * g.element_size()
+
+    def _mark_done(self, p):
+        """Record an event on the copy stream for the chunk this parameter belongs to."""
+        if self._events is not None:
+            self._events[self._chunk_of[p]].record(self.stream)
+
+    def _wait_chunk(self, k):
+        if self._events is not None:   # no events on CPU: the copies already happened inline
+            self._events[k].synchronize()
+            self.stats["syncs"] += 1
 
     def collect(self):
         """move every remaining grad off the device (call after each micro-batch backward)"""
@@ -143,6 +171,7 @@ class OffloadedAdamW:
         if not self._pending:
             return
         if self.cuda:
+            self.stats["syncs"] += 1
             self.stream.synchronize()                    # one sync, only when copies are in flight
             for p, buf in self._pending:
                 if buf is not None:
@@ -161,12 +190,47 @@ class OffloadedAdamW:
 
     @torch.no_grad()
     def step(self):
-        self.collect()
-        self.opt.step()
+        """Host AdamW, chunked so the DMA of chunk k+1 overlaps the update of chunk k.
+
+        Serial version (the default before ``pipeline_chunks`` existed) is
+        ``wait-for-every-copy -> update-everything``: the host sits idle for the whole D2H
+        phase and the link sits idle for the whole update phase. With ``K`` chunks the critical
+        path is ``max(copy, update) + one chunk`` instead of ``copy + update``.
+        """
+        import time as _t
+        t0 = _t.perf_counter()
+        if self._chunks <= 1:
+            self.collect()
+            self.stats["stream_ms"] += (_t.perf_counter() - t0) * 1e3
+            t1 = _t.perf_counter()
+            self.opt.step()
+            self.stats["host_update_ms"] += (_t.perf_counter() - t1) * 1e3
+        else:
+            # stage everything that is still on the device, without waiting
+            for p in self.params:
+                if p.grad is not None:
+                    self._offload(p)
+            by_chunk = [[] for _ in range(self._chunks)]
+            for p, buf in self._pending:
+                by_chunk[self._chunk_of[p]].append((p, buf))
+            for k, items in enumerate(by_chunk):
+                if not items:
+                    continue
+                self._wait_chunk(k)                 # only this chunk's copies
+                for p, buf in items:
+                    if buf is not None:
+                        self.cgrad[p].add_(buf)
+            self.stats["stream_ms"] += (_t.perf_counter() - t0) * 1e3
+            self._pending.clear()
+            t1 = _t.perf_counter()
+            self.opt.step()
+            self.stats["host_update_ms"] += (_t.perf_counter() - t1) * 1e3
         if self.cuda:
-            # fp32 master -> device; the copy is enqueued on the current stream, so no synchronise() needed
+            # fp32 master -> device; enqueued on the current stream, so no synchronise() needed
             for p in self.params:
                 p.data.copy_(self.master[p], non_blocking=True)
+                self.stats["h2d_ops"] += 1
+                self.stats["h2d_bytes"] += p.numel() * p.element_size()
         else:
             for p in self.params:
                 p.data.copy_(self.master[p])
@@ -192,6 +256,23 @@ class OffloadedAdamW:
             self.master[p].copy_(m)
             p.data.copy_(self.master[p])
         self._reset_accumulators()
+
+    def report(self) -> dict:
+        """What the offload actually cost -- decide with numbers, not vibes.
+
+        ``stream_ms`` is the part of the step spent waiting for / combining device copies,
+        ``host_update_ms`` is the host Adam pass. If ``host_update_ms`` dominates, offload is
+        the right call; if ``stream_ms`` dominates, the link is the bottleneck and you want
+        fewer, bigger transfers (raise ``min_numel``/``smart``) or fewer states.
+        """
+        st = dict(self.stats)
+        mb = 1 << 20
+        st["d2h_MB"] = round(st["d2h_bytes"] / mb, 2)
+        st["h2d_MB"] = round(st["h2d_bytes"] / mb, 2)
+        st["chunks"] = self._chunks
+        st["params"] = len(self.params)
+        st["grad_bytes_MB"] = round(sum(p.numel() * p.element_size() for p in self.params) / mb, 2)
+        return st
 
     def __repr__(self):
         n = sum(p.numel() for p in self.params)

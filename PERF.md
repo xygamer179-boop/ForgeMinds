@@ -220,6 +220,9 @@ within 1e-5, for dense, AC-full and AC-selective. `Trainer` config gains
 ## 5. How to check this yourself
 
 ```bash
+pytest tests/ -q                    # everything: 90 tests, ~35s on CPU
+python tests/kernel_interp_check.py # every Triton kernel vs torch, via TRITON_INTERPRET=1 (66 checks)
+python tests/forge_mp_check.py      # Forge + DDP, 2 processes
 python tests/test_sync_audit.py     # the sync budget: 1 read/step (dense), 1/MoE-layer (fallback)
 python tests/test_compile.py        # graph-break counts + fullgraph == eager equivalence
 python tests/test_offload.py        # offload numerics, accumulation, in-flight zeroing
@@ -250,6 +253,9 @@ not do this at all.
 
 ---
 
+
+---
+
 ## 6. Known limits / not verified here
 
 * No accelerator in this environment: the CUDA-only code paths (`torch._grouped_mm` dispatch, pinned
@@ -261,3 +267,61 @@ not do this at all.
 * TE / torchao FP8+INT8, the DeepSpeed engine and NCCL remain unverified, exactly as before this change.
 * `experts` are still not TP'd, EP+FSDP2 is still unsupported, and the MoE aux loss is still not
   propagated across pipeline stages (that one now warns at construction *and* is documented).
+
+---
+
+## 7. Round two: packed kernels, an accessible façade, autotuning, faster offload
+
+Same rules as above -- measured, or explicitly marked unmeasured.
+
+### 7.1 Packed Triton kernels (`forgemind/kernels/`)
+
+Six kernels, each replacing 2--7 eager ops: `rms_norm`, `add_rms_norm` (residual + norm in one
+pass), `qk_norm_rope` (per-head norm + RoPE), `swiglu`, `swiglu_split` (epilogue for a fused
+gate|up GEMM) and a distillation KL that computes `dKL/d(logits)` inside the forward pass.
+
+Real bugs found in the incoming draft, all fixed:
+
+| # | bug | consequence |
+|---|---|---|
+| 1 | gradient stored into the student-logits buffer as **hard-coded bf16** | fp16/fp32 runs get half of every gradient element overwritten: silent, and nothing raises |
+| 2 | `swiglu` forward *and* backward stored `tl.bfloat16` into an `empty_like` buffer | same corruption, both directions |
+| 3 | the KL kernel **mutated its input** (`student` logits) | the caller's tensor is destroyed; with the fused distill path this was by design, now it is an explicit flag |
+| 4 | `tl.arange(0, HD)` in the QK-norm kernel | `head_dim/2` must be a power of two or Triton fails to compile -- i.e. head_dim 96 breaks |
+| 5 | the QK-norm block was `H x HD` wide entirely | 32 heads x 128 = 4096 fp32 lanes per CTA: ~128 registers/thread per live tensor, heavy spills; now tiled over heads |
+| 6 | `swiglu_split` backward wrote `dgate`/`dup` with the **wrong stride** (used the `[N,h]` offset for the `[N,2h]` buffer) | gradients land in the neighbouring row -- caught by the interpreter test, not by shape checks |
+| 7 | output dtype was a module-global `CDT` | an fp32 model got bf16 norms back, changing the model dtype mid-graph |
+| 8 | masked tail lanes loaded `-inf`, so `ln - ls = -inf - -inf = NaN` and `0 * NaN = NaN` | poisoning the accumulator on every non-multiple-of-block vocab; now a finite sentinel |
+| 9 | the KL gradient was written even when it was not needed | a full `[chunk, vocab]` HBM write for inference-only calls |
+| 10 | `V <= BLOCK_V` still ran the two-pass loop | the whole row read from HBM twice; there is a single-tile path now |
+
+How these were found with no GPU: Triton's interpreter (`TRITON_INTERPRET=1`) runs the real
+kernels on CPU through a numpy emulator. `tests/kernel_interp_check.py` drives every kernel
+(forward and backward, including non-power-of-two `D`, non-divisible `N`, `V=5000` streaming,
+bf16 grads, input mutation) and compares against the torch reference in `_fallback.py`: **66
+checks, 0 failures**. It is wired into `pytest` as a subprocess test.
+
+### 7.2 `Forge` -- the accessible API
+
+Any `nn.Module`, any loader, two lines, with this library's guarantees kept (one host read per
+optimizer step, device-side clip coefficient, accumulation, DDP, checkpoint/resume). Verified:
+grad-accumulation equals a single big batch, `count_host_syncs` reports exactly **1** read per
+update, save/load resumes bit-identically, and a 2-process `fm.launch(nproc=2)` run leaves both
+ranks with identical parameters.
+
+### 7.3 Autotuning
+
+`tune_batch_size` scores candidates by **per-sample** cost rather than step time -- a bigger
+micro-batch usually costs the same wall time, so step-time scoring happily returns the smallest
+batch that fits. OOM is caught and reported as a trial, not raised. `autotune(forge, loader)`
+prints the table and only mutates the object when `apply=True`.
+
+### 7.4 Faster offloading
+
+`OffloadedAdamW.step()` is now chunked: the host Adam update of chunk *k* overlaps the D2H of
+chunk *k+1* (`OffloadConfig.pipeline_chunks`, default 4), so the critical path is
+`max(copy, update) + one chunk` instead of `copy + update`. Numerically identical to the serial
+path (`chunks` 1/2/3/5, bit-exact). `opt.report()` reports the split between stream wait and
+host update so you can tell whether the link or the host is your bottleneck. The full idea list
+-- including what was rejected and why (NVMe, 8-bit moments, reduce-scatter into host memory,
+a second Adam thread) -- is in **[OFFLOAD.md](OFFLOAD.md)**.

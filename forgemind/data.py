@@ -89,7 +89,12 @@ class BatchStream:
         self._buf = None
         self._event = None
         self.epoch, self.batches = 0, 0
-        self._stage()
+        try:
+            self._stage()
+        except StopIteration:
+            raise RuntimeError(
+                "BatchStream: the loader produced no batches (is the dataset smaller than "
+                f"batch_size={loader.batch_size} with drop_last=True?)") from None
 
     # ---- internal ----------------------------------------------------------------------------------------------
     def _move(self, b):

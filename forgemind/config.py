@@ -44,6 +44,7 @@ class OffloadConfig:
     act_min_bytes: int = 1 << 20
     act_layers: float = 1.0          # fraction of blocks (from the front) whose activations are offloaded
     act_pool: bool = True            # recycle pinned staging buffers instead of allocating per saved tensor
+    pipeline_chunks: int = 4         # overlap grad D2H of chunk k+1 with the host Adam update of chunk k
     experts: bool = False            # keep MoE expert weights in pinned CPU RAM, stream only the active experts
 
 
@@ -77,6 +78,9 @@ class TrainConfig:
     # data pipeline: prefetch overlaps the host->device copy of batch N+1 with step N
     prefetch: bool = True
     workers: int = 0
+    # swap RMSNorm/SwiGLU for the packed Triton kernels (needs triton + cuda; no-op otherwise)
+    fused_ops: bool = False
+    fused_split_mlp: bool = False    # also concatenate w1|w3 into one GEMM (changes the module)
 
 
 @dataclass

@@ -113,3 +113,54 @@ if __name__ == "__main__":
             print("==", k)
             f()
     print("ALL OFFLOAD TESTS PASSED")
+
+
+# ---------------------------------------------------------------- pipelined (chunked) step
+def _pipeline_pair(chunks, n_params=5, shape=(8, 4), seed=0):
+    torch.manual_seed(seed)
+    ps = [torch.nn.Parameter(torch.randn(*shape)) for _ in range(n_params)]
+    grads = [torch.randn(*shape) for _ in range(n_params)]
+    serial = OffloadedAdamW([{"params": ps}], lr=1e-2, cfg=OffloadConfig(pipeline_chunks=1))
+    torch.manual_seed(seed)
+    ps2 = [torch.nn.Parameter(p.detach().clone()) for p in ps]
+    chunked = OffloadedAdamW([{"params": ps2}], lr=1e-2,
+                             cfg=OffloadConfig(pipeline_chunks=chunks))
+    for p, g in zip(ps, grads):
+        p.grad = g.clone()
+    serial.step()
+    # simulate the asynchronous device->host staging the chunked step consumes: the buffers are
+    # "in flight", the accumulators are empty, and the step must drain them chunk by chunk.
+    before = [p.detach().clone() for p in ps2]
+    for p, g in zip(ps2, grads):
+        chunked._filled.add(p)
+        chunked._pending.append((p, g.clone()))
+    chunked.step()
+    return ps, ps2, chunked, before
+
+
+def test_chunked_step_matches_serial_step():
+    for chunks in (2, 3, 5):
+        a, b, opt, _ = _pipeline_pair(chunks)
+        for pa, pb in zip(a, b):
+            assert torch.equal(pa, pb), f"chunks={chunks} diverged"
+        assert opt._pending == []
+        assert all(b_buf.abs().sum() == 0 for b_buf in opt._cgrad_list)
+
+
+def test_chunked_step_drains_all_param_groups():
+    a, b, opt, before = _pipeline_pair(4, n_params=6)
+    assert opt.report()["chunks"] == 4
+    # every parameter actually took a step: no parameter was left behind by the chunk map
+    for pb, old in zip(b, before):
+        assert not torch.equal(pb, old), "a parameter was skipped by the chunked drain"
+    assert {opt._chunk_of[p] for p in opt.params} == set(range(4))
+
+
+def test_offload_report_shape():
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter(torch.randn(4, 4)) for _ in range(3)]
+    opt = OffloadedAdamW([{"params": ps}], lr=1e-2, cfg=OffloadConfig(pipeline_chunks=2))
+    rep = opt.report()
+    for k in ("d2h_MB", "h2d_MB", "syncs", "host_update_ms", "stream_ms", "params", "chunks"):
+        assert k in rep
+    assert rep["params"] == 3
