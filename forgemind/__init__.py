@@ -8,8 +8,9 @@ from .data import (SyntheticLM, TokenFile, BatchStream, ResumableSampler, build_
                    async_loader, to_device)
 from .perf import count_host_syncs, host_syncs
 from .forge import Forge, launch
+from .fabric import Fabric
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 def __getattr__(name):
@@ -31,5 +32,5 @@ __all__ = [
     "SyntheticLM", "TokenFile", "BatchStream", "ResumableSampler", "build_loader",
     "async_loader", "to_device",
     "count_host_syncs", "host_syncs",
-    "Forge", "launch",
+    "Forge", "launch", "Fabric",
 ]

@@ -529,3 +529,63 @@ Covered by tests on CPU: `tests/test_kernel_ops.py` (20 tests: path equality, `f
 forward+backward, `torch.export` capture, fake-impl agreement, dispatch flag, inference under
 `no_grad`), `tests/test_kernel_bench.py` (the harness and its refusal), and the existing
 interpreter suite — **66 checks, 0 failures** — plus 150 earlier tests, unchanged.
+
+---
+
+## 10. Round five: TileLens critique (sanitizer / profiler / race on the real kernels)
+
+[TileLens](https://github.com/Deep-Learning-Profiling-Tools/tilelens) (formerly *Triton-Viz*,
+PyPI `tilelens` 3.1.1) instruments plain `@triton.jit` kernels — its CLIs patch `triton.jit`
+before the script imports ForgeMind, so the analysis runs over **our actual kernels**, on CPU
+through Triton's interpreter. The probe is committed as `tools/tilelens_probe.py`.
+
+```bash
+tile-sanitizer tools/tilelens_probe.py     # symbolic out-of-bounds check (aborts on OOB)
+tile-profiler  tools/tilelens_probe.py     # mask ratios, loop unroll stats, byte counts
+tile-race      tools/tilelens_probe.py     # Z3 happens-before race detector
+TILELENS_SAVE=/tmp/probe.tvz tile-profiler tools/tilelens_probe.py   # archive for tile-visualizer
+```
+
+The probe runs all six kernels forward **and** backward on deliberately awkward shapes:
+`d=40` (non-power-of-two width), `6x95` flat SwiGLU (non-divisible element count), `h=95`
+SwiGLU-split (padded tile), `head_dim=24` (padded RoPE tile), and KL with `V=1000` (single
+tile) plus `V=5000` (two-pass loop with a tail).
+
+### 10.1 Environment (this is the recipe, not an afterthought)
+
+* `tilelens` requires `triton>=3.6`. Installed alongside `torch==2.9.1` (which pins
+  `triton==3.5.1`) you must pick one; **3.6.0 works, 3.9.0 does not**: TileLens's profiler
+  `load_overrider(ptr, mask, other, cache_modifier, eviction_policy, is_volatile)` no longer
+  matches triton 3.9's `create_masked_load(ptr, mask, other, cache_policy, volatile)` and every
+  kernel dies with `missing 1 required positional argument: 'is_volatile'`.
+* Everything below ran with `torch 2.9.1 + triton 3.6.0 + tilelens 3.1.1`, CPU interpreter.
+* `tilelens.save()`/`load()` round-trip verified (`manifest.json` + `tensors.npz` inside the
+  `.tvz`), which is what `tile-visualizer` consumes.
+
+### 10.2 Results
+
+| analysis | result | scope notes |
+|---|---|---|
+| **Sanitizer** (symbolic OOB) | **0 findings** on all six kernels, fwd+bwd, all probe shapes; exit 0 | Meaningful, not vacuous: a planted bug (store masked as fully valid past a 10-element tensor) makes it exit 1 with a full `IMA Diagnostic Report` (tensor metadata, call stack, expression tree) |
+| **Race detector** (Z3 happens-before, on by default) | **No race reported** on any kernel | Our writes are disjoint by construction — every store targets a unique `(program, element)` — so the structural argument and the tool agree. Caveat: a planted *write-write* race was **not** flagged either, so on this version the detector's write-write sensitivity is unverified; treat the clean run as "no read/write hazard found", not as a proof |
+| **Profiler** — mask ratios | High *false-element* ratios **only** on the padded/tail tiles of the probe's awkward shapes: `norm.py:68` 94.1% false at `d=40` in a 64x64 tile (6x40 real), `swiglu_split` 86% at `h=95`, KL two-pass 36.8% (the `V=5000` tail tile) | At production shapes the ratios collapse to the boundary tile only: `block_m_for(block_d)` tiles `4096/block_d` rows per program, so `d=4096` is 1 row x 4096 cols per program with **no** column mask at all. No code change: the masks are the tails, not waste inside valid data |
+| **Profiler** — loops | `qk_norm_rope`: 1 loop, `tl_static_range`, 1 step. Norm/SwiGLU: no loops | The KL `while off < V` loops are *not* reported — the profiler hooks Python `range` iteration only — so "no for-loops" for KL means "not visible to this check", not "unrolled" |
+| **Profiler** — buffer-load warning | Fires on **every** kernel | False positive on this machine: the check only passes when native `amdgcn` ASM was compiled and contains `buffer_load`; in interpreter mode there is no ASM, so the warning says "no AMD GPU was compiled", nothing about the code. Actionable only on an AMD GPU |
+
+### 10.3 What changed because of it
+
+Nothing structural — and that is the finding. The round-four work (int32 addressing, the
+two-op backward pattern) survives an independent symbolic memory-safety check, the race
+detector sees no read/write hazard, and every mask the profiler flags is a boundary tile at a
+shape we chose to be awkward. Two candidate "polish" changes were considered and **rejected
+rather than merged blind**:
+
+1. rewriting KL's `while off < V` as `tl.range(..., num_stages=...)` to expose loop pipelining —
+   plausible, but a generated-IR change with no GPU to A/B, i.e. exactly the kind of unverified
+   speed claim this file refuses to make;
+2. adding `eviction_policy="evict_first"` to streamed loads — L2 policy, invisible to the
+   interpreter, measurable only with `python -m forgemind.cli kbench --check` on the target GPU.
+
+The probe itself is the durable artifact: it is committed, documented in its docstring, and
+re-runnable in one line whenever a kernel changes. Speed acceptance stays where round four left
+it: `kbench --check` on real hardware.

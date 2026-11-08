@@ -38,10 +38,13 @@ def test_rms_norm_module_matches_torch():
     got, ref = fmnn.RMSNorm(32), nn.RMSNorm(32)
     assert torch.allclose(got(x), ref(x), atol=1e-6)
 
-    # eps=None means "finfo(dtype).eps" in torch; patching/using our module must not change that
+    # eps=None means the library default in torch; patching/using our module must not change it.
+    # Under TRITON_INTERPRET this line runs the *kernel*: it accumulates in fp32 and rounds once
+    # at the store, torch's bf16 path rounds elsewhere, so the two land within ~2 bf16 ulps
+    # (one ulp is 0.4% relative = 0.0156 at |x|=2). atol alone is below one ulp there, hence rtol.
     ref_bf16 = nn.RMSNorm(32).to(torch.bfloat16)
     got_bf16 = fmnn.RMSNorm(32, dtype=torch.bfloat16)
-    assert torch.allclose(got_bf16(x.bfloat16()), ref_bf16(x.bfloat16()), atol=1e-2)
+    assert torch.allclose(got_bf16(x.bfloat16()), ref_bf16(x.bfloat16()), atol=1e-2, rtol=2e-2)
 
     explicit = fmnn.RMSNorm(32, eps=1e-5)
     assert torch.allclose(explicit(x), nn.RMSNorm(32, eps=1e-5)(x), atol=1e-6)

@@ -85,6 +85,42 @@ main()                # module-level function; works unchanged under torchrun
 
 Mesh: world = pp * dp_replicate * dp_shard * tp; `ep` divides the DP world.
 
+## Lightning-Fabric-style loop
+
+`fm.Fabric` is the same machinery under **Lightning-Fabric's names** — a port is mostly an import
+swap. You keep the loop; the driver owns device movement, precision, DDP, collectives and
+checkpoints:
+
+```python
+import forgemind as fm
+
+fabric = fm.Fabric(accelerator="auto", devices=2, strategy="ddp", precision="bf16-mixed")
+fabric.launch()                                      # spawns; a no-op under an existing torchrun
+model, optimizer = fabric.setup(model, optimizer)    # device + precision + DDP wrap
+train_loader = fabric.setup_dataloaders(train_loader)  # batches arrive on the device
+
+for epoch in range(epochs):
+    for batch in train_loader:
+        optimizer.zero_grad()
+        with fabric.autocast():
+            loss = model(**batch)
+        fabric.backward(loss)                        # fp16 GradScaler handled for 16-mixed
+        fabric.clip_gradients(model, optimizer, max_norm=1.0)
+        optimizer.step()
+    fabric.save("ckpt.pt", {"model": model, "optimizer": optimizer, "epoch": epoch})
+```
+
+Precision names are Lightning's (`32-true`, `16-true`, `bf16-true`, `16-mixed`, `bf16-mixed`);
+also `seed_everything`, `all_reduce` / `broadcast` / `all_gather` / `barrier`, `to_device`,
+`set_epoch`, and the `is_global_zero` / `world_size` / `global_rank` properties. Strategies are
+`auto | single_device | ddp` — FSDP2, DeepSpeed, TP and PP belong to `Trainer`/`ForgeConfig`, and
+asking `Fabric` for them **raises** rather than silently degrading. Checkpoints are plain
+`torch.save` on rank 0 with DDP unwrapped (no `module.` prefix).
+
+Three shapes, one library: **`Trainer`** owns the whole loop, **`Forge`** is the two-line facade,
+**`Fabric`** is the loop you write yourself with Lightning's method names. Verified single-process
+and 2-process DDP (`tests/test_fabric.py`, `tests/fabric_mp_check.py`).
+
 ## Bring your own architecture
 
 Nothing requires `GPT`, `Trainer` or `Forge`. Take one op, one block, or fuse one module of your
@@ -170,6 +206,7 @@ torchrun --standalone --nproc_per_node=2 tests/mp_check.py tp      # fsdp_accum,
 torchrun --standalone --nproc_per_node=4 tests/mp_check.py 3d      # pp_fsdp, 3d, 3d_full, ep_equiv,
 torchrun --standalone --nproc_per_node=2 tests/mp_check.py prefetch # tp_equiv, pp_equiv, prefetch
 python tests/forge_mp_check.py                                     # Forge + launch across 2 processes
+python tests/fabric_mp_check.py                                    # Fabric + DDP across 2 processes
 ```
 
 ## Packed kernels
@@ -259,6 +296,7 @@ print(trainer.feed.report())       # batch pipeline: wait_ms_per_batch, stalled,
 | every function and its signature | [documentation.md §6](documentation.md#6-api-reference) |
 | every config field and its default | [documentation.md §7](documentation.md#7-configuration-reference) |
 | the kernel API | [documentation.md §8](documentation.md#8-kernels-reference) |
+| a Lightning-Fabric port | [documentation.md §5.4](documentation.md#54-your-own-loop-fabric-style) |
 | CLI flags (`bench`, `matrix`, `autotune`, examples, checks) | [documentation.md §9](documentation.md#9-command-line-reference) |
 | what is guaranteed, and what is *not* verified | [documentation.md §10–11](documentation.md#10-guarantees-and-invariants) |
 | an error message you just got | [documentation.md §12](documentation.md#12-troubleshooting) |
@@ -280,11 +318,13 @@ The rest (quantization backends, offload+PP, empty `evaluate()`, OOM tuning) is 
 
 ## Status
 
-Verified on CPU/gloo (see `tests/`, 140 tests): dense/MoE training, grad accumulation, checkpoint+resume,
+Verified on CPU/gloo (see `tests/`, 178 tests): dense/MoE training, grad accumulation, checkpoint+resume,
 offload optimizer equivalence (and the chunked/pipelined path), AC modes, DDP/FSDP2/HSDP/TP/PP/3D, EP
 equivalence, `torch.compile` (`aot_eager`) with `fullgraph=True` and eager-gradient equivalence, the
-packed Triton kernels run through Triton's CPU interpreter (forward *and* backward vs torch), the
-`Forge` façade (including a 2-process DDP launch), autotuning, the asynchronous batch pipeline (order,
+packed Triton kernels run through Triton's CPU interpreter (forward *and* backward vs torch) **and**
+through TileLens (formerly Triton-Viz): symbolic memory sanitizer, race detector and profiler across
+all six kernels (see [PERF.md §10](PERF.md)), the `Forge` façade and the `Fabric` driver (both with a
+2-process DDP launch), autotuning, the asynchronous batch pipeline (order,
 overlap, rank alignment, resume, thread/worker cleanup), and a one-host-sync-per-step budget.
 
 Untested here (no accelerator): CUDA offload streams and the pipelined overlap they enable, async H2D
