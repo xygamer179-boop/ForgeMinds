@@ -167,6 +167,8 @@ def test_kl_distill_does_not_train_the_teacher():
 
 
 # ---------------------------------------------------------------- backend selection
+@pytest.mark.skipif(kernels._common.INTERPRET,
+                    reason="TRITON_INTERPRET=1 runs the real kernels on CPU by design")
 def test_cpu_uses_the_torch_path_and_says_so():
     kernels.reset_stats()
     x = torch.randn(4, 8)

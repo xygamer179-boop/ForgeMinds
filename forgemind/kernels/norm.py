@@ -31,9 +31,12 @@ pre-norm-residual fusion), instead of materializing ``x + delta`` and reading it
 
 from __future__ import annotations
 
+import typing
+
 import torch
 
 from . import _fallback as fb
+from . import _ops
 from ._common import (MAX_DIM, block_m_for, fast_ok, next_pow2, nprog_for,
                       num_warps_for, tl, triton, triton_available)
 
@@ -46,7 +49,9 @@ if triton_available():
         pid = tl.program_id(0)
         rows = pid * ROWS + tl.arange(0, ROWS)
         cols = tl.arange(0, BLOCK_D)
-        off = rows.to(tl.int64)[:, None] * d + cols[None, :]
+        # 32-bit address math: `_ok` refuses tensors with >= 2**31 elements, so `row * d + col`
+        # cannot overflow, and int32 halves the register pressure of every live index vector.
+        off = rows[:, None] * d + cols[None, :]
         cm = cols < d
         rm = rows < N
         if EVEN_COL:
@@ -119,7 +124,7 @@ if triton_available():
         pid = tl.program_id(0)
         rows = pid * ROWS + tl.arange(0, ROWS)
         cols = tl.arange(0, BLOCK_D)
-        off = rows.to(tl.int64)[:, None] * d + cols[None, :]
+        off = rows[:, None] * d + cols[None, :]     # int32, see _rmsnorm_fwd
         cm = cols < d
         rm = rows < N
         if EVEN_COL:
@@ -201,76 +206,175 @@ if triton_available():
         tl.store(DWP + pid * d + cols, dw, mask=None if EVEN_COL else cm)
 
 
+def _launch_rms_fwd(x, w, eps):
+    """Launch the forward kernel; returns ``(y, rstd)`` (``rstd`` is fp32, ``[N]``)."""
+    d = x.shape[-1]
+    x2 = x.contiguous().view(-1, d)
+    n = x2.shape[0]
+    y = torch.empty_like(x2)
+    block_d = next_pow2(d)
+    rows = block_m_for(block_d)
+    rstd = torch.empty(n, device=x.device, dtype=torch.float32)
+    _rmsnorm_fwd[(triton.cdiv(n, rows),)](
+        x2, w, y, rstd, n, eps, d, rows, block_d, d == block_d, n % rows == 0, True,
+        num_warps=num_warps_for(block_d * rows))
+    return y.view(x.shape), rstd
+
+
+def _launch_rms_bwd(x, w, rstd, dy):
+    """Launch the backward kernel; returns ``(dx, dw)``."""
+    d = x.shape[-1]
+    x2 = x.contiguous().view(-1, d)
+    n = x2.shape[0]
+    dy2 = dy.contiguous().view(n, d)
+    dx = torch.empty_like(x2)
+    npg = nprog_for(n)
+    dwp = torch.empty(npg, d, device=x2.device, dtype=torch.float32)
+    block_d = next_pow2(d)
+    _rmsnorm_bwd[(npg,)](x2, w, dy2, rstd, dx, dwp, n, d, npg, block_d, d == block_d,
+                         num_warps=num_warps_for(block_d))
+    return dx.view(x.shape), dwp.sum(0, dtype=torch.float32).to(w.dtype)
+
+
+def _launch_addrms_fwd(x, delta, w, eps):
+    """Fused ``x + delta`` / RMSNorm; returns ``(xn, y, rstd)``."""
+    d = x.shape[-1]
+    x2 = x.contiguous().view(-1, d)
+    d2 = delta.contiguous().view(-1, d)
+    n = x2.shape[0]
+    xn = torch.empty_like(x2)
+    y = torch.empty_like(x2)
+    block_d = next_pow2(d)
+    rows = block_m_for(block_d)
+    rstd = torch.empty(n, device=x.device, dtype=torch.float32)
+    _addrms_fwd[(triton.cdiv(n, rows),)](
+        x2, d2, w, xn, y, rstd, n, eps, d, rows, block_d, d == block_d, n % rows == 0,
+        num_warps=num_warps_for(block_d * rows))
+    return xn.view(x.shape), y.view(x.shape), rstd
+
+
+def _launch_addrms_bwd(xn, w, rstd, gxn, gy):
+    """Returns ``(dx, ddelta, dw)``; ``dx`` and ``ddelta`` are the same tensor value."""
+    d = xn.shape[-1]
+    xn2 = xn.contiguous().view(-1, d)
+    n = xn2.shape[0]
+    gxn2 = gxn.contiguous().view(n, d)
+    gy2 = gy.contiguous().view(n, d)
+    dx = torch.empty_like(xn2)
+    dd = torch.empty_like(xn2)
+    npg = nprog_for(n)
+    dwp = torch.empty(npg, d, device=xn2.device, dtype=torch.float32)
+    block_d = next_pow2(d)
+    _addrms_bwd[(npg,)](xn2, w, gy2, gxn2, rstd, dx, dd, dwp, n, d, npg, block_d, d == block_d,
+                        num_warps=num_warps_for(block_d))
+    return (dx.view(xn.shape), dd.view(xn.shape),
+            dwp.sum(0, dtype=torch.float32).to(w.dtype))
+
+
+# ------------------------------------------------------------------ eager: autograd.Function
 class _RMSNormFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w, eps):
-        d = x.shape[-1]
-        x2 = x.contiguous().view(-1, d)
-        n = x2.shape[0]
-        y = torch.empty_like(x2)
-        block_d = next_pow2(d)
-        rows = block_m_for(block_d)
-        rstd = torch.empty(n, device=x.device, dtype=torch.float32)
-        _rmsnorm_fwd[(triton.cdiv(n, rows),)](
-            x2, w, y, rstd, n, eps, d, rows, block_d, d == block_d, n % rows == 0, True,
-            num_warps=num_warps_for(block_d * rows))
-        ctx.save_for_backward(x2, w, rstd)
-        ctx.shape = x.shape
-        return y.view(x.shape)
+        y, rstd = _launch_rms_fwd(x, w, eps)
+        ctx.save_for_backward(x, w, rstd)
+        return y
 
     @staticmethod
     def backward(ctx, dy):
-        x2, w, rstd = ctx.saved_tensors
-        n, d = x2.shape
-        dy = dy.contiguous().view(n, d)
-        dx = torch.empty_like(x2)
-        npg = nprog_for(n)
-        dwp = torch.empty(npg, d, device=x2.device, dtype=torch.float32)
-        block_d = next_pow2(d)
-        _rmsnorm_bwd[(npg,)](x2, w, dy, rstd, dx, dwp, n, d, npg, block_d, d == block_d,
-                             num_warps=num_warps_for(block_d))
-        return dx.view(ctx.shape), dwp.sum(0, dtype=torch.float32).to(w.dtype), None
+        x, w, rstd = ctx.saved_tensors
+        dx, dw = _launch_rms_bwd(x, w, rstd, dy)
+        return dx, dw, None
 
 
 class _AddRMSNormFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, delta, w, eps):
-        d = x.shape[-1]
-        x2 = x.contiguous().view(-1, d)
-        d2 = delta.contiguous().view(-1, d)
-        n = x2.shape[0]
-        xn = torch.empty_like(x2)
-        y = torch.empty_like(x2)
-        block_d = next_pow2(d)
-        rows = block_m_for(block_d)
-        rstd = torch.empty(n, device=x.device, dtype=torch.float32)
-        _addrms_fwd[(triton.cdiv(n, rows),)](
-            x2, d2, w, xn, y, rstd, n, eps, d, rows, block_d, d == block_d, n % rows == 0,
-            num_warps=num_warps_for(block_d * rows))
+        xn, y, rstd = _launch_addrms_fwd(x, delta, w, eps)
         ctx.save_for_backward(xn, w, rstd)
-        ctx.shape = x.shape
-        return xn.view(x.shape), y.view(x.shape)
+        return xn, y
 
     @staticmethod
     def backward(ctx, gxn, gy):
         xn, w, rstd = ctx.saved_tensors
-        n, d = xn.shape
-        gxn = gxn.contiguous().view(n, d)
-        gy = gy.contiguous().view(n, d)
-        dx = torch.empty_like(xn)
-        dd = torch.empty_like(xn)
-        npg = nprog_for(n)
-        dwp = torch.empty(npg, d, device=xn.device, dtype=torch.float32)
-        block_d = next_pow2(d)
-        _addrms_bwd[(npg,)](xn, w, gy, gxn, rstd, dx, dd, dwp, n, d, npg, block_d,
-                            d == block_d, num_warps=num_warps_for(block_d))
-        return dx.view(ctx.shape), dd.view(ctx.shape), \
-            dwp.sum(0, dtype=torch.float32).to(w.dtype), None
+        dx, dd, dw = _launch_addrms_bwd(xn, w, rstd, gxn, gy)
+        return dx, dd, dw, None
+
+
+# ------------------------------------------------------- traced: torch.library.custom_op
+def _rms_fake(x: torch.Tensor, w: torch.Tensor, eps: float):
+    return torch.empty_like(x), torch.empty(x.numel() // x.shape[-1], device=x.device,
+                                            dtype=torch.float32)
+
+
+def _rms_setup(ctx, inputs, output):
+    x, w, eps = inputs
+    ctx.save_for_backward(x, w, output[1])       # rstd travels through the graph
+
+
+def _rms_bwd_op(ctx, dy, _drstd):
+    x, w, rstd = ctx.saved_tensors
+    dx, dw = _RMS_BWD_OP(x, w, rstd, dy)     # an op, not a raw launch: see _ops docstring
+    return dx, dw, None
+
+
+def _addrms_fake(x: torch.Tensor, delta: torch.Tensor, w: torch.Tensor, eps: float):
+    return torch.empty_like(x), torch.empty_like(x), torch.empty(
+        x.numel() // x.shape[-1], device=x.device, dtype=torch.float32)
+
+
+def _addrms_setup(ctx, inputs, output):
+    xn, y, rstd = output
+    ctx.save_for_backward(xn, inputs[2], rstd)
+
+
+def _addrms_bwd_op(ctx, gxn, gy, _grstd):
+    xn, w, rstd = ctx.saved_tensors
+    dx, dd, dw = _ADDRMS_BWD_OP(xn, w, rstd, gxn, gy)
+    return dx, dd, dw, None
+
+
+def _rms_bwd_fake(x: torch.Tensor, w: torch.Tensor, rstd: torch.Tensor, dy: torch.Tensor):
+    return torch.empty_like(x), torch.empty_like(w)
+
+
+def _addrms_bwd_fake(xn: torch.Tensor, w: torch.Tensor, rstd: torch.Tensor, gxn: torch.Tensor,
+                     gy: torch.Tensor):
+    return torch.empty_like(xn), torch.empty_like(xn), torch.empty_like(w)
+
+
+def _rms_bwd_op_fwd(x: torch.Tensor, w: torch.Tensor, rstd: torch.Tensor,
+                    dy: torch.Tensor) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    return _launch_rms_bwd(x, w, rstd, dy)
+
+
+def _addrms_bwd_op_fwd(xn: torch.Tensor, w: torch.Tensor, rstd: torch.Tensor, gxn: torch.Tensor,
+                       gy: torch.Tensor) -> typing.Tuple[torch.Tensor, torch.Tensor,
+                                                          torch.Tensor]:
+    return _launch_addrms_bwd(xn, w, rstd, gxn, gy)
+
+
+def _rms_op_fwd(x: torch.Tensor, w: torch.Tensor,
+                eps: float) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    return _launch_rms_fwd(x, w, eps)
+
+
+def _addrms_op_fwd(x: torch.Tensor, delta: torch.Tensor, w: torch.Tensor,
+                   eps: float) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _launch_addrms_fwd(x, delta, w, eps)
+
+
+# Registered at import time; each `_ops.define*` returns None when this torch has no
+# custom_op API (the eager path then stays in charge, which is the pre-2.4 behaviour).
+_RMS_BWD_OP = _ops.define_backward("rms_norm", _rms_bwd_op_fwd, _rms_bwd_fake)
+_ADDRMS_BWD_OP = _ops.define_backward("add_rms_norm", _addrms_bwd_op_fwd, _addrms_bwd_fake)
+_RMS_OP = _ops.define("rms_norm", _rms_op_fwd, _rms_fake, _rms_setup, _rms_bwd_op)
+_ADDRMS_OP = _ops.define("add_rms_norm", _addrms_op_fwd, _addrms_fake, _addrms_setup,
+                         _addrms_bwd_op)
 
 
 def _ok(x, w):
-    # `n * d < 2**31` keeps the row-offset arithmetic in the backward loop in int32 (the fast
-    # option); past that the torch path is used. 2G elements per 2D matrix is ~4 GB of bf16.
+    # `n * d < 2**31` keeps the row-offset arithmetic in int32 (the fast option); past that the
+    # torch path is used. 2G elements per 2D matrix is ~4 GB of bf16.
     return (w is not None and x.shape[-1] == w.numel() and 0 < x.shape[-1] <= MAX_DIM
             and x.numel() < 2 ** 31 and w.dtype == x.dtype and w.is_contiguous()
             and fast_ok(x, w))
@@ -280,6 +384,8 @@ def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6) -> torch.Tenso
     """``F.rms_norm(x, (x.shape[-1],), w, eps)`` with a fused kernel; falls back to torch."""
     if not _ok(x, w):
         return fb.rms_norm(x, w, eps)
+    if _RMS_OP is not None and _ops.wanted():
+        return _RMS_OP(x, w, eps)[0]
     return _RMSNormFn.apply(x, w, eps)
 
 
@@ -287,4 +393,7 @@ def add_rms_norm(x: torch.Tensor, delta: torch.Tensor, w: torch.Tensor, eps: flo
     """Return ``(x + delta, rms_norm(x + delta, w, eps))`` writing the sum once."""
     if not _ok(x, w) or delta.shape != x.shape:
         return fb.add_rms_norm(x, delta, w, eps)
+    if _ADDRMS_OP is not None and _ops.wanted():
+        xn, y, _rstd = _ADDRMS_OP(x, delta, w, eps)
+        return xn, y
     return _AddRMSNormFn.apply(x, delta, w, eps)
