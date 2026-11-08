@@ -15,6 +15,12 @@ available -- so importing this package never breaks a CPU or MPS run.
     fm.kernels.patch(model.norm)                 # ...or one module at a time
     fm.kernels.set_backend("fallback")           # force the torch path (A/B, debugging)
     fm.kernels.stats()                           # which path ran, and how often
+    fm.kernels.use_custom_ops(True)              # force the torch.library path (export/AOTI)
+
+Each kernel is two things at once: a Triton launch reached through ``autograd.Function`` when
+eager, and a ``torch.library.custom_op`` (fake impl + registered backward) while
+``torch.compile`` traces, so a compiled model keeps it in one graph and ``torch.export`` can
+capture it. Same launch, same numbers -- ``tests/test_kernel_ops.py`` asserts equality.
 
 The kernels are tested in Triton's interpreter (``TRITON_INTERPRET=1``) on CPU against the
 torch reference in ``forgemind.kernels._fallback``, so "make them bug free" is a statement
@@ -23,6 +29,7 @@ with a test behind it rather than a hope.
 
 from . import _common
 from ._common import HAS_TRITON, get_backend, reset_stats, set_backend, stats
+from ._ops import use_custom_ops   # public: force the torch.library path
 from .apply import enable, patch
 from .kl import distill_kl, kl_distill_loss, kl_div, kl_div_logits
 from .norm import add_rms_norm, rms_norm
@@ -33,7 +40,7 @@ __all__ = [
     "HAS_TRITON", "set_backend", "get_backend", "stats", "reset_stats",
     "rms_norm", "add_rms_norm", "qk_norm_rope", "swiglu", "swiglu_split",
     "kl_div_logits", "kl_div", "kl_distill_loss", "distill_kl",
-    "enable", "patch", "available",
+    "enable", "patch", "available", "use_custom_ops",
 ]
 
 

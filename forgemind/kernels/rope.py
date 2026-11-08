@@ -21,8 +21,9 @@ Bugs fixed relative to the first draft
    ``2 * HD != head_dim``). Now the two halves are stored explicitly and the partial buffer is
    ``2 * HD`` wide, which is the weight length by construction.
 5. ``Out`` was hard-coded to bf16; it is ``x.dtype`` now, so fp32/fp16 models keep their dtype.
-6. ``t = n % T`` was computed in int32 from an int64 program id and could overflow for
-   ``B * T * H * D`` above 2^31 elements; the table index is int64 now.
+6. The row index is int32 on the fast path, like every other kernel here: ``_ok`` refuses
+   tensors with >= 2**31 elements, so ``n * H * D`` cannot wrap, and a 64-bit program id would
+   promote every address vector derived from it to int64 (twice the index registers, for free).
 
 Numerics: same fp32 accumulation as the rest of the package, so it is bit-comparable to the
 torch reference in ``_fallback.qk_norm_rope`` up to the output cast.
@@ -30,9 +31,12 @@ torch reference in ``_fallback.qk_norm_rope`` up to the output cast.
 
 from __future__ import annotations
 
+import typing
+
 import torch
 
 from . import _fallback as fb
+from . import _ops
 from ._common import (MAX_DIM, fast_ok, next_pow2, nprog_for, num_warps_for, tl, triton,
                       triton_available)
 
@@ -42,7 +46,9 @@ if triton_available():
     def _qknorm_rope_fwd(X, W, Cos, Sin, Out, Rstd, T, eps,
                          H: tl.constexpr, HD: tl.constexpr, HDP: tl.constexpr,
                          BLOCK_H: tl.constexpr):
-        n = tl.program_id(0).to(tl.int64)
+        # int32 row index: `_ok` refuses >= 2**31 elements, so `n * H * D` cannot wrap. A 64-bit
+        # program id here would promote every address vector below to int64 as well.
+        n = tl.program_id(0)
         t = n % T                                    # [B,T,...] row -> position
         D = 2 * HD
         cols = tl.arange(0, HDP)
@@ -81,14 +87,13 @@ if triton_available():
         dw1 = tl.zeros([HDP], dtype=tl.float32)
         n = pid
         while n < N:
-            n64 = n.to(tl.int64)
-            t = n64 % T
+            t = n % T
             c = tl.load(Cos + t * HD + cols, mask=cm, other=0.0).to(tl.float32)
             s = tl.load(Sin + t * HD + cols, mask=cm, other=0.0).to(tl.float32)
             for h0 in tl.static_range(0, H, BLOCK_H):
                 hv = h0 + tl.arange(0, BLOCK_H)
                 hm = hv < H
-                off = n64 * (H * 2 * HD) + hv[:, None] * (2 * HD) + cols[None, :]
+                off = n * (H * 2 * HD) + hv[:, None] * (2 * HD) + cols[None, :]
                 m = hm[:, None] & cm[None, :]
                 g0 = tl.load(GO + off, mask=m, other=0.0).to(tl.float32)
                 g1 = tl.load(GO + off + HD, mask=m, other=0.0).to(tl.float32)
@@ -97,7 +102,7 @@ if triton_available():
                 gy1 = g1 * c[None, :] - g0 * s[None, :]
                 x0 = tl.load(X + off, mask=m, other=0.0).to(tl.float32)
                 x1 = tl.load(X + off + HD, mask=m, other=0.0).to(tl.float32)
-                r = tl.load(Rstd + n64 * H + hv, mask=hm, other=0.0)[:, None]
+                r = tl.load(Rstd + n * H + hv, mask=hm, other=0.0)[:, None]
                 xh0 = x0 * r
                 xh1 = x1 * r
                 gw0 = gy0 * w0[None, :]
@@ -114,38 +119,90 @@ if triton_available():
         tl.store(DWP + pid * (2 * HD) + HD + ci, dw1, mask=cm)
 
 
+def _launch_qk_norm_rope(x, w, cos, sin, eps):
+    """Per-head RMSNorm + RoPE; returns ``(out, rstd)`` with ``rstd`` of shape ``[B, T, H]``."""
+    b, t_len, h, d = x.shape
+    hd = d // 2
+    out = torch.empty_like(x)
+    rstd = torch.empty(b * t_len * h, device=x.device, dtype=torch.float32)
+    hdp = next_pow2(hd)
+    block_h = 8 if hdp <= 64 else 4
+    warps = num_warps_for(min(h, block_h) * hdp)
+    _qknorm_rope_fwd[(b * t_len,)](x, w, cos, sin, out, rstd, t_len, eps, h, hd, hdp, block_h,
+                                   num_warps=warps)
+    return out, rstd
+
+
+def _launch_qk_norm_rope_bwd(x, w, cos, sin, rstd, g):
+    """Returns ``(dx, dw)``."""
+    b, t_len, h, d = x.shape
+    hd = d // 2
+    g = g.contiguous()
+    dx = torch.empty_like(x)
+    n = b * t_len
+    npg = nprog_for(n)
+    dwp = torch.empty(npg, d, device=x.device, dtype=torch.float32)
+    hdp = next_pow2(hd)
+    block_h = 8 if hdp <= 64 else 4
+    warps = num_warps_for(min(h, block_h) * hdp)
+    _qknorm_rope_bwd[(npg,)](x, w, cos, sin, g, rstd, dx, dwp, n, t_len, h, hd, hdp, block_h, npg,
+                             num_warps=warps)
+    return dx, dwp.sum(0, dtype=torch.float32).to(w.dtype)
+
+
+# ------------------------------------------------------------------ eager: autograd.Function
 class _QKNormRoPE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w, cos, sin, eps):
-        b, t_len, h, d = x.shape
-        hd = d // 2
-        out = torch.empty_like(x)
-        rstd = torch.empty(b * t_len * h, device=x.device, dtype=torch.float32)
-        hdp = next_pow2(hd)
-        block_h = 8 if hdp <= 64 else 4
-        _qknorm_rope_fwd[(b * t_len,)](x, w, cos, sin, out, rstd, t_len, eps,
-                                       h, hd, hdp, block_h,
-                                       num_warps=num_warps_for(min(h, block_h) * hdp))
+        out, rstd = _launch_qk_norm_rope(x, w, cos, sin, eps)
         ctx.save_for_backward(x, w, cos, sin, rstd)
-        ctx.dims = (b, t_len, h, d, eps)
         return out
 
     @staticmethod
     def backward(ctx, g):
         x, w, cos, sin, rstd = ctx.saved_tensors
-        b, t_len, h, d = ctx.dims[:4]
-        hd = d // 2
-        g = g.contiguous()
-        dx = torch.empty_like(x)
-        n = b * t_len
-        npg = nprog_for(n)
-        dwp = torch.empty(npg, d, device=x.device, dtype=torch.float32)
-        hdp = next_pow2(hd)
-        block_h = 8 if hdp <= 64 else 4
-        _qknorm_rope_bwd[(npg,)](x, w, cos, sin, g, rstd, dx, dwp, n, t_len,
-                                 h, hd, hdp, block_h, npg,
-                                 num_warps=num_warps_for(min(h, block_h) * hdp))
-        return dx, dwp.sum(0, dtype=torch.float32).to(w.dtype), None, None, None
+        dx, dw = _launch_qk_norm_rope_bwd(x, w, cos, sin, rstd, g)
+        return dx, dw, None, None, None
+
+
+# ------------------------------------------------------- traced: torch.library.custom_op
+def _rope_fake(x: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+               eps: float):
+    b, t_len, h, d = x.shape
+    return (torch.empty_like(x),
+            torch.empty(b * t_len * h, device=x.device, dtype=torch.float32))
+
+
+def _rope_setup(ctx, inputs, output):
+    x, w, cos, sin, eps = inputs
+    ctx.save_for_backward(x, w, cos, sin, output[1])
+
+
+def _rope_bwd_op(ctx, g, _grstd):
+    # One gradient per *input* (x, w, cos, sin, eps) -- torch appends the metadata slot itself.
+    x, w, cos, sin, rstd = ctx.saved_tensors
+    dx, dw = _ROPE_BWD_OP(x, w, cos, sin, rstd, g)
+    return dx, dw, None, None, None
+
+
+def _rope_bwd_fake(x: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                   rstd: torch.Tensor, g: torch.Tensor):
+    return torch.empty_like(x), torch.empty_like(w)
+
+
+def _rope_bwd_op_fwd(x: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                     rstd: torch.Tensor, g: torch.Tensor) -> typing.Tuple[torch.Tensor,
+                                                                          torch.Tensor]:
+    return _launch_qk_norm_rope_bwd(x, w, cos, sin, rstd, g)
+
+
+def _rope_op_fwd(x: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                 eps: float) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    return _launch_qk_norm_rope(x, w, cos, sin, eps)
+
+
+_ROPE_BWD_OP = _ops.define_backward("qk_norm_rope", _rope_bwd_op_fwd, _rope_bwd_fake)
+_ROPE_OP = _ops.define("qk_norm_rope", _rope_op_fwd, _rope_fake, _rope_setup, _rope_bwd_op)
 
 
 def _ok(x, w, cos, sin):
@@ -175,4 +232,6 @@ def qk_norm_rope(x: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch
     if not _ok(x, w, cos, sin):
         return fb.qk_norm_rope(x, w, cos.reshape(1, x.shape[1], 1, -1),
                                sin.reshape(1, x.shape[1], 1, -1), eps)
+    if _ROPE_OP is not None and _ops.wanted():
+        return _ROPE_OP(x, w, cos, sin, eps)[0]
     return _QKNormRoPE.apply(x, w, cos, sin, eps)

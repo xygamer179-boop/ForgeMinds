@@ -2,7 +2,7 @@
 
 PyTorch training library: FSDP2/HSDP/DDP, tensor/pipeline/expert parallelism (3D), DeepSpeed ZeRO backend,
 FP8 (Transformer Engine / torchao) and INT8 training, smart gradient/activation/expert offload, MoE, packed
-Triton kernels, device autotuning, an asynchronous batch pipeline, and a full trainer.
+Triton kernels (torch.compile-native), device autotuning, an asynchronous batch pipeline, and a full trainer.
 It is an **extension, not a framework**: every kernel and block below is usable on its own,
 inside an architecture you already have.
 
@@ -28,7 +28,7 @@ kernels fall back to torch with identical numerics.
 ```bash
 torchrun --nproc_per_node=4 examples/train_gpt.py --moe --dp-replicate 4 --ep 2
 torchrun --nproc_per_node=4 examples/train_gpt.py --tp 2 --dp-shard 2
-pytest tests/               # 140 tests: trainer, parallel, kernels, forge, async batches, autotune, offload
+pytest tests/               # 173 tests: trainer, parallel, kernels, forge, async batches, autotune, offload
 torchrun --standalone --nproc_per_node=2 tests/mp_check.py ep_equiv   # also ddp, fsdp, pp, tp, prefetch, ...
 ```
 
@@ -114,7 +114,7 @@ fm.kernels.patch(model.mlp, split=True)        #     (kind="norm"/"mlp" if the n
 
 | you want | use | notes |
 |---|---|---|
-| one fused op | `fm.kernels.rms_norm` / `swiglu` / `swiglu_split` / `add_rms_norm` / `qk_norm_rope` | differentiable, dtype-preserving, torch expression when Triton is absent |
+| one fused op | `fm.kernels.rms_norm` / `swiglu` / `swiglu_split` / `add_rms_norm` / `qk_norm_rope` | differentiable, dtype-preserving, compile/export-native, torch expression when Triton is absent |
 | one block | `fmnn.RMSNorm(dim)` / `fmnn.SwiGLU(dim, hidden)` | plain `nn.Module`s; `RMSNorm` is `nn.RMSNorm`-compatible, `SwiGLU(split=True)` fuses gate\|up into one GEMM |
 | your own module | `fm.kernels.patch(m, split=False, kind=None)` | returns `True` if recognised, idempotent, preserves biases, works on torch's classes too |
 | the whole tree | `fm.kernels.enable(model)` | what `Trainer` does when `fused_ops=True` |
@@ -186,6 +186,15 @@ import forgemind as fm
 y = fm.kernels.rms_norm(x, w, 1e-6)         # == F.rms_norm(x, (d,), w, eps)
 fm.kernels.enable(model)                    # or patch RMSNorm/SwiGLU modules in place
 loss = fm.kernels.kl_distill_loss(hs, ht, w, teacher_head)   # teacher_head = teacher's lm_head (callable)
+```
+
+They are `torch.compile`-native: eager calls go through `autograd.Function`, but while a graph is
+traced each kernel is a `torch.library.custom_op` with a fake implementation and a registered
+backward, so it stays **inside** the graph (`fullgraph=True`) and `torch.export` captures it —
+which is what an AOTInductor serving stack needs. Same launch either way, bit-identical numbers.
+
+```bash
+python -m forgemind.cli kbench --check   # per-op A/B/C vs inductor on your GPU; exit 3 if we lose
 ```
 
 ## Autotuning

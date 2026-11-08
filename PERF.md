@@ -441,3 +441,91 @@ multi-GPU device binding are written and reasoned about, and the CPU paths that 
 code are tested, but there is no accelerator in this environment. Treat the GPU speedup as
 **unmeasured** — measure it with `trainer.feed.report()`, which returns
 `wait_ms_per_batch`, `stalled`, `stall_ratio` and `produce_ms` for exactly this purpose.
+
+---
+
+## 9. Round four: kernels as `torch.library` ops (compile-native, no eager regression)
+
+The kernels were already correct and already graph-break-free in the dense path. What they were not
+was *first class* to `torch.compile`: an `autograd.Function` is opaque to `torch.export`, and
+AOTInductor (the ahead-of-time serving path) cannot capture it at all. Round four fixes that without
+making the eager path any slower.
+
+### 9.1 The dispatch rule, and why it is not one path
+
+Same Triton launch, two entry points:
+
+| path | used when | cost per call (measured, CPU, 20k calls of a 64x64 op) |
+|---|---|---|
+| `torch.autograd.Function.apply` | eager | **24.2 µs** |
+| `torch.library.custom_op` | while `torch.compile` traces (or forced) | **59.0 µs** |
+| plain torch expression, for scale | — | 11.7 µs |
+
+A custom op is the slowest way to call Python-level torch code: every call re-enters the dispatcher
+through a boxed Python kernel. Using it unconditionally would have been a genuine **speed
+regression** in eager, which is exactly what these kernels are not allowed to cause. But inside a
+compiled graph the overhead is gone — the op is captured once and the graph replays from C++ — and
+that is where the op buys things a `Function` cannot:
+
+1. a **fake implementation**, so dynamo/inductor/export propagate shapes and dtypes without running
+   the kernel;
+2. a **registered backward** that AOTAutograd places in the backward graph like any other node,
+   including under activation checkpointing;
+3. **`torch.export` compatibility** — the exported graph contains `forgemind.rms_norm.default`.
+
+So: `Function` in eager, `custom_op` while tracing. `fm.kernels.use_custom_ops(True)` forces the op
+path (tests, exporters), `FORGEMIND_KERNEL_OPS=ops|eager` does it from the environment, and both
+paths call the same launcher — `tests/test_kernel_ops.py` asserts the values *and* the gradients are
+bit-identical, not merely close.
+
+### 9.2 The backward has to be an op too
+
+The first version registered only the forward and let the backward launch Triton directly. That
+fails the moment AOTAutograd traces the *joint* graph:
+
+```
+RuntimeError: Attempted to access the data pointer on an invalid python storage.
+```
+
+The registered backward is ordinary Python that dynamo traces — with FakeTensors. A raw launch
+inside it runs against fake storage during compilation. The fix is the pattern production kernel
+libraries use: every kernel registers **two** ops, `forgemind::<name>` (fake + autograd) and
+`forgemind::<name>_backward` (fake, no autograd), and the Python backward is a single op call. Eleven
+ops in total. The same exercise surfaced the gradient-count convention: a registered backward returns
+one gradient per *input* (torch appends its metadata slot itself), which is not obvious from the
+error message (`expected 6, got 3`).
+
+### 9.3 Kernel-level work that can only remove work
+
+No GPU here, so nothing in this list is a measured claim — each item strictly *removes* instructions
+or registers, which is why it was safe to make without a stopwatch:
+
+* **32-bit address arithmetic** in `rms_norm`, `add_rms_norm`, `swiglu`, `swiglu_split`,
+  `qk_norm_rope` and `kl`. Every one of those kernels already refuses tensors with `>= 2**31`
+  elements in its Python guard, so no offset can wrap; a 64-bit index was doubling the register
+  footprint of every live address tile for nothing (and in `kl`, an `int64` row for a per-program
+  scalar that is bounded by `N`).
+* **one address computation** for the `swiglu_split` store instead of two, and the same for the
+  backward's `src`/`dst` (they are the same offset by construction).
+* the mask-free `EVEN_*` paths, the `ROWS` tiling and the fp32-only-where-needed stores were already
+  in place from round two and were left alone — re-tuning them blind is how a "no regression"
+  promise gets broken.
+
+### 9.4 Verifying it on real hardware
+
+`python -m forgemind.cli kbench` times each kernel against the eager expression *and* against
+inductor's output for the same expression (plus a `kernel+compile` column), min-of-N with CUDA
+events, forward or forward+backward. `--check` turns it into a gate:
+
+```bash
+python -m forgemind.cli kbench --check --tolerance 0   # exit 3 if any kernel loses to inductor
+```
+
+That is the honest form of "no GPU speed decrease": the harness refuses to run on CPU (where the
+kernels fall back and every column measures the same expression), and no number in this file is
+claimed from a machine without an accelerator.
+
+Covered by tests on CPU: `tests/test_kernel_ops.py` (20 tests: path equality, `fullgraph=True`
+forward+backward, `torch.export` capture, fake-impl agreement, dispatch flag, inference under
+`no_grad`), `tests/test_kernel_bench.py` (the harness and its refusal), and the existing
+interpreter suite — **66 checks, 0 failures** — plus 150 earlier tests, unchanged.

@@ -1,6 +1,6 @@
 # ForgeMind documentation
 
-Reference and guide for **forgemind 0.5.0** — a PyTorch training library with FSDP2/HSDP/DDP,
+Reference and guide for **forgemind 0.6.0** — a PyTorch training library with FSDP2/HSDP/DDP,
 tensor/pipeline/expert parallelism, DeepSpeed ZeRO, FP8/INT8 quantized training, gradient /
 activation / expert offload, MoE, packed Triton kernels, device autotuning, an asynchronous batch
 pipeline, and two levels of trainer API.
@@ -307,9 +307,17 @@ y = fm.kernels.qk_norm_rope(q, w, cos, sin)      # per-head RMSNorm + RoPE, x is
 loss = fm.kernels.kl_distill_loss(hs, ht, w, teacher_head)
 ```
 
-Every one is differentiable (custom `Function`, exact gradients, `gradcheck`ed for the blocks),
-keeps the input dtype, and **is the torch expression when Triton is not available** — so the same
-line of code runs on CPU, MPS and CUDA.
+Every one is differentiable (exact gradients, `gradcheck`ed for the blocks), keeps the input
+dtype, and **is the torch expression when Triton is not available** — so the same line of code
+runs on CPU, MPS and CUDA.
+
+Two dispatch paths, both your friend: **eager** goes through `torch.autograd.Function` (the
+cheapest way to call a kernel from Python), **while `torch.compile` traces** the same launch is
+a `torch.library.custom_op` with a fake implementation and a registered backward. That is why a
+compiled model keeps the kernel inside one graph, `fullgraph=True` passes, and `torch.export`
+can capture the op instead of hitting an opaque `autograd.Function` (measurements in
+[PERF.md §9](PERF.md)). Both paths call the same launch, so the numbers are bit-identical —
+`tests/test_kernel_ops.py` asserts exactly that.
 
 **One block, as a module.** `fm.nn` holds the two building blocks most architectures need, as
 ordinary `nn.Module`s you can put inside your own model:
@@ -404,6 +412,7 @@ Triton or CUDA is missing:
 fm.kernels.available()             # False on CPU (the torch expression is used, not an error)
 fm.kernels.set_backend("fallback") # force the torch path to A/B your own change
 fm.kernels.stats()                 # which path ran, and how often
+fm.kernels.use_custom_ops(True)    # force the torch.library path (export, AOTI, debugging)
 ```
 
 ### 5.4 Your own loop, Fabric-style
@@ -905,6 +914,7 @@ fm.kernels.patch(module, split=False, kind=None) -> bool     # one module; False
 fm.kernels.available() -> bool
 fm.kernels.set_backend("auto" | "fallback" | "triton")
 fm.kernels.get_backend() / fm.kernels.stats()
+fm.kernels.use_custom_ops(None | True | False) -> bool   # None = automatic (on while tracing)
 ```
 
 Correctness, not just speed: the kernels had ten bugs fixed before they were wired in (wrong dtype
@@ -919,6 +929,33 @@ TRITON_INTERPRET=1 python tests/kernel_interp_check.py     # 66 checks, forward 
 
 `tests/test_kernels.py` drives the same comparisons through pytest (19 tests, including
 non-contiguous inputs, `dim=1` RMSNorm, odd `head_dim`, bf16 gradients and `V=5000` streaming).
+
+**`torch.compile` / `torch.export`.** Each kernel is registered as `torch.ops.forgemind.<name>`
+(fake implementation + registered backward) and is used whenever `torch.compile` traces, so:
+
+* `fullgraph=True` passes with the kernel in the graph (no break, no eager fallback);
+* the backward is a second op (`forgemind::<name>_backward`), so AOTAutograd compiles it too — a raw
+  launch inside a registered backward would run against FakeTensors during the joint trace and blow up;
+* `torch.export` emits `forgemind.rms_norm.default` as a node, which is what AOTInductor serving
+  stacks need. Second-order gradients are not supported (the Triton backward has no `grad_fn`), the
+  same as before this change.
+
+In eager the kernels still go through `torch.autograd.Function`: a custom op costs ~59 µs/call of
+Python against ~24 µs for `Function.apply`, which would be a real regression for small tensors, so the
+op path is entered only where that overhead is amortised — inside a compiled graph.
+
+Speed is a separate question, and it is answered per op against the thing it has to beat,
+`torch.compile`'s inductor output, on the hardware you actually train on:
+
+```bash
+python -m forgemind.cli kbench                       # eager vs inductor vs kernel, fwd+bwd
+python -m forgemind.cli kbench --ops rms_norm --mode fwd
+python -m forgemind.cli kbench --check --tolerance 0 # exit 3 if any kernel loses to inductor
+```
+
+`--check` is a gate, not a report: it fails the run when a kernel is slower than the baseline, so
+"no GPU speed decrease" is a command rather than a claim. (It refuses to run on CPU, where the
+kernels fall back and every column measures the same expression.)
 
 ---
 
@@ -989,7 +1026,7 @@ These are enforced by tests, not just intentions.
 
 ## 11. Verified vs not verified
 
-Verified on CPU/gloo in this repository (`pytest tests/`, 140 tests):
+Verified on CPU/gloo in this repository (`pytest tests/`, 173 tests):
 
 * dense and MoE training, gradient accumulation, checkpoint + resume;
 * `OffloadedAdamW` equivalence including the chunked/pipelined path, activation offload;
@@ -997,6 +1034,8 @@ Verified on CPU/gloo in this repository (`pytest tests/`, 140 tests):
 * DDP / FSDP2 / HSDP / TP / PP / 3D and EP equivalence (`mp_check.py`, up to 8 ranks);
 * `torch.compile` with `aot_eager` (graph breaks counted, `fullgraph=True`, eager-gradient equality);
 * the packed Triton kernels through Triton's CPU interpreter, forward and backward (66 checks);
+* the kernels as `torch.library.custom_op`s: identical values and gradients to the eager path,
+  `fullgraph=True` forward+backward, `torch.export` capture, and fake-impl shape/dtype agreement;
 * the `Forge` façade including a 2-process `fm.launch` run and bit-identical replicas;
 * autotuning (batch-size search, OOM handling, report shape);
 * the asynchronous batch pipeline: order, epoch bookkeeping, overlap timing, error forwarding,
@@ -1008,7 +1047,8 @@ Verified on CPU/gloo in this repository (`pytest tests/`, 140 tests):
 * CUDA offload streams and the pipelined overlap they enable;
 * async H2D overlap, pinned-buffer reuse and `record_stream` under memory pressure in the batch
   pipeline (the CPU code paths are exercised; the GPU win is unmeasured);
-* kernel launch *speed* on real hardware (correctness is verified through the interpreter);
+* kernel launch *speed* on real hardware (correctness is verified through the interpreter; the
+  `kbench --check` gate exists to be run there and is **not** a measured claim here);
 * fused kernels under `torch.compile` on CUDA, `torch._grouped_mm` dispatch;
 * Transformer Engine FP8, torchao INT8 training, the DeepSpeed engine, NCCL.
 
@@ -1067,7 +1107,9 @@ PP stages; experts not TP'd or quantized; optimizer offload not for FSDP/PP; no 
 
 Test files by concern: `test_single.py` (trainer basics), `test_edge_cases.py`, `test_sync_audit.py`
 (sync budget), `test_compile.py` (graph breaks), `test_forge.py`, `test_async_batches.py` (data
-pipeline), `test_offload.py`, `test_kernels.py`, `test_autotune.py`, `test_ds_config.py`
+pipeline), `test_offload.py`, `test_kernels.py`, `test_kernel_ops.py` (the `torch.library` op path:
+eager-vs-op equality, `fullgraph`, export), `test_kernel_bench.py` (the `kbench` harness),
+`test_autotune.py`, `test_ds_config.py`
 (DeepSpeed config generation), `test_nn_blocks.py` (the blocks and `patch` are drop-in
 compatible with torch, differentiable, and trainable in a hand-written model), `test_docs.py` (these documents: every documented `fm.*` name must
 exist, every anchor must resolve, every config field must be documented).

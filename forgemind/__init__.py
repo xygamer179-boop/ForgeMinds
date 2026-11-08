@@ -9,7 +9,7 @@ from .data import (SyntheticLM, TokenFile, BatchStream, ResumableSampler, build_
 from .perf import count_host_syncs, host_syncs
 from .forge import Forge, launch
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 
 def __getattr__(name):

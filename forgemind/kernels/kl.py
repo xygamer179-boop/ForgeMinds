@@ -71,7 +71,8 @@ if triton_available():
                            BLOCK_V: tl.constexpr, WRITE_GRAD: tl.constexpr,
                            SINGLE: tl.constexpr):
         """Per-row online-logsumexp forward KL + dKL/d(student logits) * inv_N into G."""
-        row = tl.program_id(0).to(tl.int64)
+        # int32 is enough: _kernel_ok() rejects numel >= 2**31, so row * stride < 2**31
+        row = tl.program_id(0)
         s_row = S_ptr + row * s_stride
         t_row = T_ptr + row * t_stride
         g_row = G_ptr + row * g_stride
