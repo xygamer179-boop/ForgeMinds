@@ -36,6 +36,7 @@ and why) is in [OFFLOAD.md](OFFLOAD.md).
    - [5.11 Checkpoint and resume](#511-checkpoint-and-resume)
    - [5.12 Evaluation](#512-evaluation)
    - [5.13 Measuring](#513-measuring)
+   - [5.14 Muon: one optimizer for the whole model](#514-muon-one-optimizer-for-the-whole-model)
 6. [API reference](#6-api-reference)
 7. [Configuration reference](#7-configuration-reference)
 8. [Kernels reference](#8-kernels-reference)
@@ -705,6 +706,42 @@ print(trainer.feed.report())      # the batch pipeline: wait_ms_per_batch, stall
 `feed.report()['wait_ms_per_batch']` near zero means the producer is keeping up; a `stall_ratio` well
 above zero means the loader is the bottleneck and `workers` / `prefetch_depth` are the knobs.
 
+### 5.14 Muon: one optimizer for the whole model
+
+```python
+opt = fm.Muon(model.parameters(), lr=0.02, weight_decay=0.01)
+for batch in loader:
+    opt.zero_grad()
+    loss = model(batch).sum()
+    loss.backward()
+    opt.step()
+```
+
+One optimizer, two update rules, decided by shape: parameters with `ndim >= 2` (Linear
+weights, conv filters, ...) get **Muon** -- momentum orthogonalized by quintic Newton-Schulz
+(`fm.kernels.newton_schulz`), i.e. steepest descent under the spectral norm; everything else
+(`ndim < 2`: biases, norms, ...) gets a decoupled **AdamW** with `betas` / `eps` / `adam_lr`.
+Same-shape matrices are stacked and orthogonalized in one batched NS call, so a layer of
+identically shaped matrices costs one call per shape bucket, not one per matrix.
+
+* explicit control: pass param-group dicts with `use_muon=True/False` (a group without the
+  flag is auto-split by `ndim`, keeping its hyperparameters); per-group `lr`,
+  `weight_decay`, `momentum`, `nesterov`, `ns_steps`, `ns_dtype` are honored;
+* `ns_dtype=torch.bfloat16` by default (the canonical fast choice); pass
+  `torch.float32` for maximum accuracy -- the kernels accept either;
+* multi-GPU: each shape bucket is computed on a disjoint `rank::world` share and combined
+  with **one** `all_reduce`; with `world == 1` (or no `torch.distributed` at all) there is
+  not a single collective call;
+* the update never touches `p.grad` or the momentum buffer in place (the reference Muon
+  file this was ported from did both -- the six found bugs are listed in
+  [PERF.md section 11](PERF.md) and each has a regression test in `tests/test_muon.py`).
+
+Verified: `tests/test_muon.py` (24 tests: orthogonality, reference parity, the bug
+regressions, batched-vs-single equality, compile/tracing dispatch) plus a 2-process DDP
+check (`tests/muon_mp_check.py`) that requires bit-identical replicas *and* equality with a
+single-process run. `python -m forgemind.cli kbench --ops newton_schulz` includes the NS
+kernel in the speed gate.
+
 ---
 
 ## 6. API reference
@@ -822,6 +859,23 @@ fm.Fabric(accelerator="auto", devices=1, strategy="auto", precision="32-true", *
 | `.all_reduce(t, reduce_op="mean")` / `.broadcast(t, src=0)` / `.all_gather(t)` / `.barrier()` | collectives (no-ops at world 1) |
 | `.is_global_zero` / `.world_size` / `.global_rank` / `.local_rank` / `.device` | facts |
 | `.precision` / `.strategy` / `.accelerator` / `.repr` | configuration |
+
+### Muon (optimizer)
+
+```python
+fm.Muon(params, lr=0.02, weight_decay=0.0, momentum=0.95, nesterov=True, ns_steps=5,
+        ns_dtype=torch.bfloat16, betas=(0.9, 0.95), eps=1e-10, adam_lr=None)
+```
+
+| detail | behavior |
+|---|---|
+| `params` | iterable of tensors (auto-split: `ndim >= 2` -> Muon, else AdamW) or param-group dicts; generators are fine |
+| group dicts | `use_muon=True/False` selects the update; without the flag the group is split by `ndim` keeping its hyperparameters; unknown keys pass through |
+| state | Muon: `momentum_buffer`; AdamW: `exp_avg`, `exp_avg_sq`, `step` (per parameter) |
+| `step(closure=None)` | `@torch.no_grad()`; bucketed batched NS per shape; one `all_reduce` per bucket only when `dist` is initialized with `world > 1` |
+| decay | decoupled on both paths: `p *= 1 - lr * weight_decay`, then the step |
+| `add_param_group` | same auto-split/validation as the constructor |
+| rejects | a `use_muon=True` group containing `ndim < 2` parameters (ValueError saying what to do instead) |
 
 ### Data
 
@@ -978,6 +1032,7 @@ fm.kernels.kl_distill_loss(hs, ht, w, teacher_head, chunk=4096)   # KL on logits
 #   teacher_head: a callable (the teacher's lm_head) -- run under no_grad, never accumulates grads
 fm.kernels.kl_div_logits(student, teacher, reduction="mean", grad_dtype=None)
 fm.kernels.kl_div(student, teacher, reduction="mean", grad_dtype=None)
+fm.kernels.newton_schulz(g, steps=5, dtype=None, fused=True)  # batched (..., m, n) -> same shape, Muon's polar step
 
 fm.kernels.enable(model, norm=True, swiglu_mlp=True, split=False)  # patch a whole tree in place
 fm.kernels.patch(module, split=False, kind=None) -> bool     # one module; False = not recognised
@@ -1013,6 +1068,21 @@ non-contiguous inputs, `dim=1` RMSNorm, odd `head_dim`, bf16 gradients and `V=50
 In eager the kernels still go through `torch.autograd.Function`: a custom op costs ~59 µs/call of
 Python against ~24 µs for `Function.apply`, which would be a real regression for small tensors, so the
 op path is entered only where that overhead is amortised — inside a compiled graph.
+
+**`newton_schulz` is deliberately not a custom op.** It is an optimizer utility called under
+`no_grad`, so there is nothing to differentiate; while `torch.compile` traces it, it simply runs
+the pure-torch implementation — dynamo sees ordinary tensor ops (`fullgraph=True` holds) and
+inductor fuses the elementwise chain from its side. Eager on CUDA (or under
+`TRITON_INTERPRET=1`) keeps the three GEMMs per iteration in torch (cuBLAS, the benchmark) and
+fuses the five elementwise ops into two Triton kernels (`B = b*A + c*A@A`, then
+`X = a*X + B@X`): 10 elementwise launches per five-step NS instead of 25, same FLOPs — a
+structural no-regression claim whose speed half is measured by
+`kbench --ops newton_schulz` + `--check` on hardware. `fused=False` forces the torch path
+(the A/B baseline); `set_backend("fallback")` and the `stats()` counters behave as for every
+other kernel. Numerics: the quintic is evaluated as `b*A + c*(A@A)`, while the reference
+source line `b*A + c*A @ A` parses left-to-right as `b*A + (c*A)@A` — mathematically
+identical, a few bf16 ulps apart (measured ≤ 0.04 absolute on the output), pinned by tests
+on both sides; the two dispatch paths agree to ≤ 1e-5 in fp32.
 
 Speed is a separate question, and it is answered per op against the thing it has to beat,
 `torch.compile`'s inductor output, on the hardware you actually train on:
@@ -1096,7 +1166,7 @@ These are enforced by tests, not just intentions.
 
 ## 11. Verified vs not verified
 
-Verified on CPU/gloo in this repository (`pytest tests/`, 178 tests — and 194 with
+Verified on CPU/gloo in this repository (`pytest tests/`, 201 tests — and 218 with
 `TRITON_INTERPRET=1`, where the real kernels run inside the test suite too):
 
 * dense and MoE training, gradient accumulation, checkpoint + resume;
@@ -1108,6 +1178,13 @@ Verified on CPU/gloo in this repository (`pytest tests/`, 178 tests — and 194 
 * the kernels as `torch.library.custom_op`s: identical values and gradients to the eager path,
   `fullgraph=True` forward+backward, `torch.export` capture, and fake-impl shape/dtype agreement;
 * the `Forge` façade including a 2-process `fm.launch` run and bit-identical replicas;
+* `fm.Muon` end to end: reference parity (bf16 tolerance), singular values driven toward 1
+  after five NS steps, batched bucket == per-matrix loop, one regression test per bug found
+  in the reference file, and a real 2-process DDP run whose replicas are bit-identical
+  *and* equal to a single-process `fm.Muon` run (no collective at world 1);
+* the `newton_schulz` kernels through **TileLens** as well (0 findings; a planted
+  out-of-bounds in the update kernel aborts the sanitizer, proving the NS kernels are
+  instrumented) and through `kbench`'s op table;
 * the `Fabric` driver: precision mapping, `clip_gradients`, sampler-epoch contract, save/load
   round-trip, and a real 2-process DDP run (bit-identical replicas, rank-0 checkpoint restored
   on both ranks);
@@ -1164,6 +1241,7 @@ PP stages; experts not TP'd or quantized; optimizer offload not for FSDP/PP; no 
 | `forgemind/trainer.py` | `Trainer`: config → mesh → quant → TP → AC → compile → DP → pipeline, optimizer, data, step, eval, checkpoint |
 | `forgemind/forge.py` | `Forge` façade and `launch` |
 | `forgemind/fabric.py` | `Fabric`: the Lightning-Fabric-compatible driver (setup/precision/DDP/collectives/checkpoints) |
+| `forgemind/muon.py` | `Muon`: Muon (spectral-norm momentum + batched Newton-Schulz) for matrices, AdamW for vectors |
 | `forgemind/data.py` | datasets, `ResumableSampler`, `BatchStream`, `async_loader`, `to_device`, `build_loader` |
 | `forgemind/config.py` | `ForgeConfig` and the four sub-configs |
 | `forgemind/models/` | `GPT`, blocks, RoPE, chunked cross-entropy |
@@ -1172,13 +1250,13 @@ PP stages; experts not TP'd or quantized; optimizer offload not for FSDP/PP; no 
 | `forgemind/quant.py` | quantized training (TE fp8, torchao int8) and the 8-bit optimizer |
 | `forgemind/offload.py` | `OffloadedAdamW`, activation offload, pinned buffer pooling |
 | `forgemind/perf.py` | host-sync counting, `warn_once`, fast-math defaults, pinned pool |
-| `forgemind/kernels/` | Triton kernels, torch fallbacks, `apply.patch()` / `apply.enable()` |
+| `forgemind/kernels/` | Triton kernels (including `ns.py`, the Newton-Schulz step behind `fm.Muon`), torch fallbacks, `apply.patch()` / `apply.enable()` |
 | `forgemind/nn.py` | composable blocks: `RMSNorm` (with fused residual), `SwiGLU` (dense or fused gate\|up) |
 | `forgemind/autotune.py` | `apply_fast_defaults`, `tune_batch_size`, `autotune`, kernel sweep |
 | `forgemind/distributed.py`, `forgemind/loss.py` | mesh/groups init, chunked CE/KL losses |
 | `forgemind/cli/` | `bench.py`, `matrix.py`, `__main__` |
 | `examples/train_gpt.py` | runnable GPT/MoE training script with the full flag set |
-| `tests/` | unit suite plus `mp_check.py`, `forge_mp_check.py`, `fabric_mp_check.py`, `kernel_interp_check.py` |
+| `tests/` | unit suite plus `mp_check.py`, `forge_mp_check.py`, `fabric_mp_check.py`, `muon_mp_check.py`, `kernel_interp_check.py` |
 | `documentation.md` | this file: guide, API/config reference, troubleshooting, verified/unverified matrix |
 | `PERF.md` | the performance audit: stall sites, graph breaks, both measurement rounds, bug tables |
 | `OFFLOAD.md` | offload design and rejected alternatives |
@@ -1188,7 +1266,8 @@ Test files by concern: `test_single.py` (trainer basics), `test_edge_cases.py`, 
 pipeline), `test_offload.py`, `test_kernels.py`, `test_kernel_ops.py` (the `torch.library` op path:
 eager-vs-op equality, `fullgraph`, export), `test_kernel_bench.py` (the `kbench` harness),
 `test_fabric.py` (the Lightning-Fabric driver: precision, DDP, sampler epochs, checkpoints),
-`test_autotune.py`, `test_ds_config.py`
+`test_muon.py` (the Muon optimizer and the NS kernel: reference parity, the found-bug
+regressions, bucketed batching, compile dispatch, subprocess mp check), `test_autotune.py`, `test_ds_config.py`
 (DeepSpeed config generation), `test_nn_blocks.py` (the blocks and `patch` are drop-in
 compatible with torch, differentiable, and trainable in a hand-written model), `test_docs.py` (these documents: every documented `fm.*` name must
 exist, every anchor must resolve, every config field must be documented).

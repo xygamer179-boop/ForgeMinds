@@ -33,6 +33,7 @@ from ._ops import use_custom_ops   # public: force the torch.library path
 from .apply import enable, patch
 from .kl import distill_kl, kl_distill_loss, kl_div, kl_div_logits
 from .norm import add_rms_norm, rms_norm
+from .ns import newton_schulz
 from .rope import qk_norm_rope
 from .swiglu import swiglu, swiglu_split
 
@@ -40,6 +41,7 @@ __all__ = [
     "HAS_TRITON", "set_backend", "get_backend", "stats", "reset_stats",
     "rms_norm", "add_rms_norm", "qk_norm_rope", "swiglu", "swiglu_split",
     "kl_div_logits", "kl_div", "kl_distill_loss", "distill_kl",
+    "newton_schulz",
     "enable", "patch", "available", "use_custom_ops",
 ]
 
