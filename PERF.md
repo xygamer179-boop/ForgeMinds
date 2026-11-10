@@ -589,3 +589,75 @@ rather than merged blind**:
 The probe itself is the durable artifact: it is committed, documented in its docstring, and
 re-runnable in one line whenever a kernel changes. Speed acceptance stays where round four left
 it: `kbench --check` on real hardware.
+
+---
+
+## 11. Round six: Muon + `newton_schulz` (bug hunt on the reference optimizer)
+
+Task: *"optimize it further, find bugs, and add Muon to the kernels."* The attachment was a
+Keller-Jordan-style Muon reference (478 lines: distributed / SingleDevice / WithAuxAdam
+variants plus a Fast path with a Triton Gram kernel). It was audited line by line; every
+finding below is encoded as a regression test in `tests/test_muon.py` rather than left as
+prose.
+
+### 11.1 Bugs found in the reference file
+
+| # | where | what happens | our fix (test) |
+|---|---|---|---|
+| 1 | `muon_update`, `nesterov=False` | `update = momentum` aliases the state buffer, then `update *= sqrt(max(1, rows/cols))` **scales the buffer every step** -- on a tall matrix the factor compounds as `(m/n)^(t/2)` (4x after 4 steps at 16x8) | the scale is applied to the NS output only; the buffer is never written (`test_nesterov_false_keeps_buffer_unscaled`) |
+| 2 | `muon_update`, `nesterov=True` | `grad.lerp_(momentum, beta)` **mutates `p.grad` in place** -- under `zero_grad(set_to_none=False)` or any post-step grad read, accumulation sees a momentum-blended value | out-of-place `g.lerp(buf, beta)` (`test_nesterov_does_not_mutate_grad`, `test_grad_accumulation_survives_step`) |
+| 3 | `Muon.__init__` / `step` | `dist.get_world_size()` unconditional (single-process runs crash); pad count `world - len % world` adds a whole extra pad block when `len % world == 0`; `isinstance(params[0], Parameter)` rejects generators and param-group dicts; the NS `ndim >= 2` assert dies on the first bias of an unsplit model | `dist` consulted only when initialized with world > 1; **no padding** (disjoint `rank::world` shares summed by one `all_reduce`); any iterable or group spec accepted; auto-split by `ndim` (`test_auto_split_groups_and_generators`) |
+| 4 | `MuonWithAuxAdam.__init__` | `set(group.keys()) == {...}` asserts reject any extra key (a scheduler leftover, `ns_steps`, ...) | unknown keys pass through (`test_explicit_groups_honored`) |
+| 5 | `None`-grad handling | `p.grad = state["zero_grad"]` writes a cached zero tensor **into the model**, and the nesterov lerp then corrupts that cache for later `None`-grad steps | local zeros; `p.grad` stays `None` (`test_none_grad_param_stays_none`) |
+| 6 | `SingleDeviceMuon` step | same class of problems as 1-2 on the single-device path (buffer scale, grad mutation, `p.grad` writes) | one implementation covers single and multi process (`test_parity_with_attached_reference` pins the reference semantics where it was correct) |
+
+The file's own `FastMuonWithAuxAdam` already fixed the grad mutation and the dist-at-world-1
+problem, and it contains the two patterns worth porting: shape-bucketed batched NS and the
+disjoint-slice `all_reduce`. Its Triton Gram kernel (`_mmt_kernel`, upper-tiles-only +
+transpose store) was **not** ported: cuBLAS `bmm` is the benchmark to beat, there is no GPU
+here to A/B it, and shipping an unverifiable "fast" path is how regressions sneak in.
+
+### 11.2 The `newton_schulz` kernel
+
+Per NS iteration the math is 3 GEMMs plus 5 elementwise ops in eager torch. The GEMMs are
+cuBLAS either way (the same backend inductor would pick), so the elementwise chain becomes
+**two** Triton kernels -- `B = b*A + c*A@A`, then `X = a*X + (B@X)` -- for **10 vs 25
+elementwise launches** over five iterations (5 vs 8 launches per iteration counting GEMMs),
+same FLOPs, one fewer HBM round trip per intermediate. That is a *structural*
+no-regression argument (launches + HBM on identical math); the speed half stays with
+`python -m forgemind.cli kbench --ops newton_schulz` + `kbench --check` on hardware.
+
+Dispatch deliberately does **not** use a `torch.library` op: NS is a no-grad optimizer
+utility, so while dynamo traces, `newton_schulz` returns the pure-torch implementation --
+dynamo sees ordinary tensor ops (`fullgraph=True` holds; measured in
+`test_ns_compile_fullgraph_matches_eager`) and inductor fuses the elementwise chain from
+its side. Eager + CUDA (or `TRITON_INTERPRET=1`) takes the fused path; `fused=False`
+forces torch for A/B; `set_backend("fallback")` and the `stats()` counters behave as for
+every other kernel (no state is mutated while tracing -- same rule as round four).
+
+Numerics: both paths agree in fp32 to <= 1e-5, and with the reference within a few bf16
+ulps -- measured <= 0.04 absolute on the NS output after five iterations. The quintic is
+evaluated as `b*A + c*(A@A)`; the reference source line `b*A + c*A @ A` parses
+left-to-right as `b*A + (c*A)@A`. The two are mathematically identical; re-associating is
+exactly what buys two launches, because the reference order needs a third elementwise pass
+to materialize `c*A` before the second GEMM. Both associations are pinned by tests
+(`test_ns_matches_reference_single_matrix` <= 0.05 bf16, path agreement <= 1e-5 fp32).
+
+### 11.3 Measured (CPU only; this sandbox has no GPU)
+
+| check | result |
+|---|---|
+| `pytest tests/test_muon.py` | 23 passed + 1 skipped (CPU: fused-Triton case skips); 24 passed under `TRITON_INTERPRET=1` (fused path live) |
+| NS singular values after 5 steps (fp32) | all within `[0.68, 1.13]` across tall/wide/batched shapes (test bound 1 +/- 0.35) |
+| reference parity, 3 steps, conv + 3xLinear | max param diff 0.0071 (threshold 0.015; dominated by the documented bf16 re-association) |
+| batched bucket vs per-matrix loop, 2 steps (fp32) | max diff < 1e-4 |
+| 2-process DDP check (`tests/muon_mp_check.py`, gloo) | replicas bit-identical **and** bit-equal to a single-process `fm.Muon` run; also passes under `TRITON_INTERPRET=1` |
+| `tile-sanitizer tools/tilelens_probe.py` | 0 findings on the NS kernels; a planted out-of-bounds in `_ns_update_kernel` aborts the run (exit 1), proving the NS kernels are instrumented -- then reverted |
+| `tile-profiler` | mask tables reported for `ns.py` (tail-block masks, e.g. 57% masked on the 63x17 scenario); the buffer-load warning is the same known CPU/AMD false positive as section 10 |
+| `kbench --ops newton_schulz --allow-cpu` | the row prints (eager ~= kernel on CPU, because every column is torch there); `inductor = nan` on this box for **all** ops -- the sandbox has no `Python.h` for inductor's C++ toolchain (environment limitation, pre-existing) |
+| `kbench --check` | still refuses CPU (the documented exit-2 guard): speed acceptance is GPU-only |
+
+GPU-unverified by policy: fused-vs-torch launch speed on real shapes, bf16 tensor-core
+occupancy of the GEMM chain, and `num_warps` tuning for the flat kernels. The claim that
+survives without a GPU is the structural one: fewer launches and HBM round trips over the
+same arithmetic, measured by a command (`kbench --check`) that exists to be run there.

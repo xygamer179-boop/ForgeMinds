@@ -29,9 +29,11 @@ import time
 import torch
 
 from ..kernels import _fallback as fb
+from ..kernels.ns import _ns_torch
 from .. import kernels
 
-DEFAULT_OPS = ["rms_norm", "add_rms_norm", "swiglu", "swiglu_split", "qk_norm_rope", "kl_div_logits"]
+DEFAULT_OPS = ["rms_norm", "add_rms_norm", "swiglu", "swiglu_split", "qk_norm_rope",
+               "kl_div_logits", "newton_schulz"]
 
 
 # --------------------------------------------------------------------------- workloads
@@ -94,6 +96,15 @@ def _cases(op, tokens, dim, hidden, batch, seq, heads, head_dim, vocab, dtype):
                 return kernels.kl_div_logits(t[0], t[1])
             return fb.kl_div_logits(t[0], t[1])[0]
         return [Case("kl_div_logits", f"[{batch * 64},{vocab}] {dtype}", f, backward=False)]
+
+    if op == "newton_schulz":
+        # no gradient: Muon calls NS inside optimizer.step under no_grad, so fwd-only rows
+        # are the honest measurement; packed = fused-Triton elementwise, eager = pure torch.
+        def f(t, k):
+            if k:
+                return kernels.newton_schulz(t[0])
+            return _ns_torch(t[0], 5, None)
+        return [Case("newton_schulz", f"[{dim},{dim}] {dtype}", f, backward=False)]
 
     raise ValueError(f"unknown op {op!r}, choose from {DEFAULT_OPS}")
 
@@ -275,6 +286,8 @@ def _case_tensors(case, op, a, dev, dtype):
     if op == "kl_div_logits":
         s = torch.randn(a.batch * 64, a.vocab, device=dev, dtype=dtype)
         return [s, torch.randn_like(s)]
+    if op == "newton_schulz":
+        return [torch.randn(a.dim, a.dim, device=dev, dtype=dtype)]
     raise ValueError(op)
 
 

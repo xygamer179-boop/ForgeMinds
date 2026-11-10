@@ -10,7 +10,7 @@ from .perf import count_host_syncs, host_syncs
 from .forge import Forge, launch
 from .fabric import Fabric
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 
 def __getattr__(name):
@@ -20,9 +20,12 @@ def __getattr__(name):
     pulls in the kernels package, and ``import forgemind`` should stay cheap for people who only
     want the trainer.
     """
-    if name in ("kernels", "forge", "autotune", "nn"):
+    if name in ("kernels", "forge", "autotune", "nn", "muon"):
         import importlib
         return importlib.import_module(f".{name}", __name__)
+    if name == "Muon":
+        from .muon import Muon
+        return Muon
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 __all__ = [
     "ForgeConfig", "ParallelConfig", "QuantConfig", "OffloadConfig", "TrainConfig",
@@ -32,5 +35,5 @@ __all__ = [
     "SyntheticLM", "TokenFile", "BatchStream", "ResumableSampler", "build_loader",
     "async_loader", "to_device",
     "count_host_syncs", "host_syncs",
-    "Forge", "launch", "Fabric",
+    "Forge", "launch", "Fabric", "Muon",
 ]

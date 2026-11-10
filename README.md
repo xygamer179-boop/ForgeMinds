@@ -28,7 +28,7 @@ kernels fall back to torch with identical numerics.
 ```bash
 torchrun --nproc_per_node=4 examples/train_gpt.py --moe --dp-replicate 4 --ep 2
 torchrun --nproc_per_node=4 examples/train_gpt.py --tp 2 --dp-shard 2
-pytest tests/               # 173 tests: trainer, parallel, kernels, forge, async batches, autotune, offload
+pytest tests/               # 201 tests: trainer, parallel, kernels, forge, async batches, autotune, offload, muon
 torchrun --standalone --nproc_per_node=2 tests/mp_check.py ep_equiv   # also ddp, fsdp, pp, tp, prefetch, ...
 ```
 
@@ -207,14 +207,16 @@ torchrun --standalone --nproc_per_node=4 tests/mp_check.py 3d      # pp_fsdp, 3d
 torchrun --standalone --nproc_per_node=2 tests/mp_check.py prefetch # tp_equiv, pp_equiv, prefetch
 python tests/forge_mp_check.py                                     # Forge + launch across 2 processes
 python tests/fabric_mp_check.py                                    # Fabric + DDP across 2 processes
+python tests/muon_mp_check.py                                      # Muon + DDP across 2 processes
 ```
 
 ## Packed kernels
 
 `fm.kernels` has fused Triton kernels for the ops that are usually *several* eager kernels:
 `rms_norm`, `add_rms_norm` (residual+norm in one pass), `qk_norm_rope` (per-head norm + RoPE),
-`swiglu` / `swiglu_split` (fused gate|up projection epilogue), and a distillation KL that
-computes the logit gradient in the forward pass. Every one is a drop-in for the eager expression,
+`swiglu` / `swiglu_split` (fused gate|up projection epilogue), a distillation KL that
+computes the logit gradient in the forward pass, and `newton_schulz` (the quintic
+orthogonalization that gives `fm.Muon` its spectral-norm steps). Every one is a drop-in for the eager expression,
 degrades to torch on CPU/MPS, and is verified against the torch reference by running the *actual
 kernels* through `TRITON_INTERPRET=1` on CPU (`tests/test_kernels.py`, 66 numeric checks).
 
@@ -230,9 +232,36 @@ traced each kernel is a `torch.library.custom_op` with a fake implementation and
 backward, so it stays **inside** the graph (`fullgraph=True`) and `torch.export` captures it —
 which is what an AOTInductor serving stack needs. Same launch either way, bit-identical numbers.
 
+`newton_schulz` is the one kernel that is *not* a `custom_op`: it runs under `no_grad` inside
+`Optimizer.step`, so tracing simply uses the pure-torch path (dynamo sees ordinary ops), while
+eager fuses each iteration's five elementwise ops down to two Triton kernels with the GEMMs
+staying in cuBLAS.
+
 ```bash
 python -m forgemind.cli kbench --check   # per-op A/B/C vs inductor on your GPU; exit 3 if we lose
 ```
+
+## Muon optimizer
+
+```python
+opt = fm.Muon(model.parameters(), lr=0.02)     # matrices -> Muon, vectors -> AdamW
+```
+
+`fm.Muon` is one optimizer for the whole model: `ndim >= 2` parameters (Linear, conv
+filters, ...) get momentum orthogonalized by batched quintic Newton-Schulz — same-shape
+matrices share one batched call per step — and everything else gets decoupled AdamW.
+Explicit param-group dicts with `use_muon=True/False` are honored (per-group `lr`,
+`weight_decay`, `momentum`, `nesterov`, `ns_steps`, `ns_dtype`, `betas`, `eps`). Multi-GPU
+shards each shape bucket across ranks and combines the disjoint shares with a single
+`all_reduce`; single-process runs make **no** `torch.distributed` calls at all. Unlike the
+reference implementation it neither mutates `p.grad` in the nesterov blend nor scales the
+momentum buffer every step — six bugs were found in the reference file and fixed, each with
+a regression test (see [PERF.md section 11](PERF.md)).
+
+Verified by `tests/test_muon.py` (reference parity, singular values driven to 1,
+batched==per-matrix, the bug regressions, compile/tracing dispatch) and a 2-process DDP
+check (`tests/muon_mp_check.py`: bit-identical replicas == a single-process run). The NS
+kernel joins the speed gate via `python -m forgemind.cli kbench --ops newton_schulz`.
 
 ## Autotuning
 
@@ -297,6 +326,7 @@ print(trainer.feed.report())       # batch pipeline: wait_ms_per_batch, stalled,
 | every config field and its default | [documentation.md §7](documentation.md#7-configuration-reference) |
 | the kernel API | [documentation.md §8](documentation.md#8-kernels-reference) |
 | a Lightning-Fabric port | [documentation.md §5.4](documentation.md#54-your-own-loop-fabric-style) |
+| a Muon optimizer | [documentation.md §5.14](documentation.md#514-muon-one-optimizer-for-the-whole-model) |
 | CLI flags (`bench`, `matrix`, `autotune`, examples, checks) | [documentation.md §9](documentation.md#9-command-line-reference) |
 | what is guaranteed, and what is *not* verified | [documentation.md §10–11](documentation.md#10-guarantees-and-invariants) |
 | an error message you just got | [documentation.md §12](documentation.md#12-troubleshooting) |
@@ -318,13 +348,14 @@ The rest (quantization backends, offload+PP, empty `evaluate()`, OOM tuning) is 
 
 ## Status
 
-Verified on CPU/gloo (see `tests/`, 178 tests): dense/MoE training, grad accumulation, checkpoint+resume,
+Verified on CPU/gloo (see `tests/`, 201 tests): dense/MoE training, grad accumulation, checkpoint+resume,
 offload optimizer equivalence (and the chunked/pipelined path), AC modes, DDP/FSDP2/HSDP/TP/PP/3D, EP
 equivalence, `torch.compile` (`aot_eager`) with `fullgraph=True` and eager-gradient equivalence, the
 packed Triton kernels run through Triton's CPU interpreter (forward *and* backward vs torch) **and**
 through TileLens (formerly Triton-Viz): symbolic memory sanitizer, race detector and profiler across
 all six kernels (see [PERF.md §10](PERF.md)), the `Forge` façade and the `Fabric` driver (both with a
-2-process DDP launch), autotuning, the asynchronous batch pipeline (order,
+2-process DDP launch), `fm.Muon` (reference parity, the six fixed reference bugs as regression tests,
+a 2-process DDP check), autotuning, the asynchronous batch pipeline (order,
 overlap, rank alignment, resume, thread/worker cleanup), and a one-host-sync-per-step budget.
 
 Untested here (no accelerator): CUDA offload streams and the pipelined overlap they enable, async H2D

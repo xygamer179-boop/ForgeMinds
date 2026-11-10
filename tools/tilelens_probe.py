@@ -82,6 +82,14 @@ def main():
     go("kl_div_logits(V=5000, two-pass + tail)",
        lambda t: fm.kernels.kl_div_logits(t[0], t[1]), [st2, te2])
 
+    # --- newton_schulz (Muon): tall matrix -> short-side Gram, flat elementwise tail blocks --
+    m = torch.randn(63, 17)                      # m > n: the transposed path; Gram 17x17=289
+    go("newton_schulz(63x17, transposed)",
+       lambda t: fm.kernels.newton_schulz(t[0]), [m], backward=False)
+    b = torch.randn(4, 31, 20)                   # Muon bucket batch; updates 1071 elems/row batch
+    go("newton_schulz(4x31x20, batched)",
+       lambda t: fm.kernels.newton_schulz(t[0]), [b], backward=False)
+
     save = os.environ.get("TILELENS_SAVE")
     if save:
         # Visualizer data path: archive the trace TileLens recorded (zip: manifest + tensors.npz)
