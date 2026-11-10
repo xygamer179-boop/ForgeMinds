@@ -3,8 +3,8 @@
 ForgeMind's ``Trainer`` is opinionated: it knows about GPT blocks, MoE routing, pipeline
 schedules and DeepSpeed. That is great when you are training the model it was written for and
 useless when you have a ``nn.Module``, a ``DataLoader`` and a loss function. ``Forge`` is the
-small, boring interface for the second case -- the same one Lightning/Fabric gives you, with
-the same guarantees this library is built on: **one host synchronization per optimizer step**,
+small, boring interface for the second case -- a loop you can read in one screen, with the
+guarantees this library is built on: **one host synchronization per optimizer step**,
 device-side clipping, accumulated micro-batches, and everything optional.
 
 Three ways to use it, in increasing order of control::
@@ -13,7 +13,7 @@ Three ways to use it, in increasing order of control::
     forge = fm.Forge(model, optimizer, loss_fn=criterion, precision="bf16")
     forge.fit(loader, max_steps=1000)
 
-    # 2. Fabric style: you own the loop
+    # 2. you own the loop
     out = model(x); loss = criterion(out, y)
     forge.backward(loss)        # scaled by 1/accum, autocast already applied
     forge.step()                # updates only every `accum` calls
@@ -54,8 +54,10 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+import random
 import time
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -63,11 +65,11 @@ import torch.nn as nn
 from .config import OffloadConfig, ParallelConfig
 from .data import async_loader as _async_loader
 from .data import to_device as _to_device
-from .distributed import cleanup, init_distributed
+from .distributed import barrier, cleanup, init_distributed
 from .offload import OffloadedAdamW
 from .perf import count_host_syncs, warn_once
 
-__all__ = ["Forge", "launch", "ForgeState"]
+__all__ = ["Forge", "launch", "ForgeState", "seed_everything"]
 
 _PRECISIONS = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -203,7 +205,7 @@ class Forge:
         return nn.parallel.DistributedDataParallel(model, device_ids=device_ids)
 
     def setup(self, model=None, optimizer=None):
-        """Fabric-compatible alias: ``model, opt = forge.setup(model, opt)``."""
+        """Return ``(model, optimizer)`` -- the stored ones for anything omitted."""
         return (model if model is not None else self.model,
                 optimizer if optimizer is not None else self.optimizer)
 
@@ -388,18 +390,26 @@ class Forge:
 
     # ------------------------------------------------------------------ state
     def save(self, path: str):
-        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-        model = self.raw_model
-        if isinstance(model, nn.parallel.DistributedDataParallel):
-            model = model.module
-        torch.save({
-            "model": model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict() if self.scheduler else None,
-            "step": self.step_count,
-            "ema_loss": self.ema_loss,
-            "rng": torch.get_rng_state(),
-        }, path)
+        """Rank 0 writes the checkpoint; the other ranks wait at the barrier.
+
+        Under DDP every rank holds identical weights, so letting all of them write the same
+        file is a race for zero benefit (the old separate Fabric driver got this right --
+        the discipline now lives here).
+        """
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+            model = self.raw_model
+            if isinstance(model, nn.parallel.DistributedDataParallel):
+                model = model.module
+            torch.save({
+                "model": model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.scheduler.state_dict() if self.scheduler else None,
+                "step": self.step_count,
+                "ema_loss": self.ema_loss,
+                "rng": torch.get_rng_state(),
+            }, path)
+        barrier()
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
@@ -424,6 +434,18 @@ class Forge:
         n = sum(p.numel() for p in self.raw_model.parameters())
         return (f"Forge(model_params={n/1e6:.2f}M, device={self.device.type}, "
                 f"precision={self.precision}, accum={self.accum}, world={self.world_size})")
+
+
+def seed_everything(seed: int = 1234, workers: bool = False) -> int:
+    """Seed torch, python and numpy RNGs; returns the seed (workers inherit via fork)."""
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if workers:
+        os.environ.setdefault("PYTHONHASHSEED", str(seed))
+    return seed
 
 
 # ---------------------------------------------------------------------- launcher

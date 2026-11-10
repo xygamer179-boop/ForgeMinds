@@ -77,6 +77,44 @@ def log(ctx: Optional[DistContext], *a, **k):
         print(*a, flush=True, **k)
 
 
+# ---------------------------------------------------------------------------
+# Collectives for custom loops (``fm.launch``-ed scripts). World 1 or no process
+# group: every one is a passthrough -- *no* collective call at all. These used to
+# live on a Lightning-Fabric-shaped class; they are plain functions now, because
+# ForgeMind is not a port of Lightning.
+def all_reduce(tensor: torch.Tensor, reduce_op: str = "mean") -> torch.Tensor:
+    """Reduce ``tensor`` in place across the world: ``mean`` | ``sum`` | ``max`` | ``min``."""
+    op = {"sum": dist.ReduceOp.SUM, "mean": dist.ReduceOp.AVG,
+          "max": dist.ReduceOp.MAX, "min": dist.ReduceOp.MIN}[reduce_op]
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return tensor
+    dist.all_reduce(tensor, op=op)
+    return tensor
+
+
+def broadcast(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+    """Broadcast ``tensor`` from rank ``src`` (world 1: returned unchanged)."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return tensor
+    dist.broadcast(tensor, src=src)
+    return tensor
+
+
+def all_gather(tensor: torch.Tensor) -> torch.Tensor:
+    """Gather along dim 0: ``world_size`` copies concatenated (world 1: as-is)."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return tensor
+    out = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(out, tensor)
+    return torch.cat(out, dim=0)
+
+
+def barrier() -> None:
+    """No-op at world 1."""
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.barrier()
+
+
 def init_distributed(pc: ParallelConfig, backend: Optional[str] = None) -> DistContext:
     world = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))

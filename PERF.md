@@ -661,3 +661,109 @@ GPU-unverified by policy: fused-vs-torch launch speed on real shapes, bf16 tenso
 occupancy of the GEMM chain, and `num_warps` tuning for the flat kernels. The claim that
 survives without a GPU is the structural one: fewer launches and HBM round trips over the
 same arithmetic, measured by a command (`kbench --check`) that exists to be run there.
+
+---
+
+## 12. Round seven: profiler audit + topk + softmax
+
+### 12.1 Method
+
+`tools/profile_audit.py` (committed) drives three measurements from one entry point:
+
+* **op table** — `torch.profiler` with `table_sort_by_self_cpu_time_ms`, top 25 ops over a
+  3-step steady-state window (after warmup steps that trigger compile/cudagraph effects);
+* **host-read audit** — the same profiler's `SYNC_OPS` (`aten::item`,
+  `aten::_local_scalar_dense`, `aten::tolist`) plus `torch._dynamo.explain` for graph breaks;
+* **churn table** — highest-count ops (launch/python/view tax rather than flops).
+
+Flags: default = dense `Trainer` step, `--forge` = `Forge.step`, `--moe` = the MoE config,
+`--trace` = chrome-trace JSON dump.
+
+**Attribution caveat (tooling finding).** In torch 2.9.1 the profiler's stack capture is
+empty even with `with_stack=True`: `function_events[].stack` is `[]` and the chrome trace's
+`args.frames` are absent, for every op we checked. Source attribution was therefore done by
+wrapping `Tensor.item` / `Tensor.tolist` with a Python-stack recorder (the
+`count_host_syncs` idea, extended to `.item`) — that is how §12.3's numbers got their
+caller. Recorded here so nobody re-tries the stack path.
+
+### 12.2 Graph breaks (the compile/cudagraph question)
+
+| model | graphs | breaks | verdict |
+|---|---|---|---|
+| dense `Trainer` step | 1 | **0** | `fullgraph=True` claim holds on the real loop |
+| dense `Forge` step | 1 | **0** | same loop, façade entry |
+| MoE `Trainer` step | 6 | 5 | every break = `Skip inlining torch.compiler.disable()d function` — the **deliberate** MoE dispatch disables, reported not "fixed" |
+
+### 12.3 Host reads: the one-sync budget, and what else calls `.item()`
+
+Steady state, dense Trainer, 3-step window:
+
+| read | per step | source |
+|---|---|---|
+| `aten::tolist` | **1** | `trainer.py:301` — the stacked `flag/gn/loss` read. Budget held. |
+| `aten::item` | **21** | `torch.optim.AdamW.step` → `_single_tensor_adam`: one bias-correction `item` per parameter tensor (21 params in the audit model) |
+
+The 21 are **not** ForgeMind code and **not** the documented budget item. On CUDA,
+non-capturable AdamW keeps `state["step"]` on the CPU, so the math is host-side rather than
+a device sync — *unverified on GPU, flagged as such*. Options if it ever shows up on a
+profile: `fm.Muon`/our Adam (Python-int step, zero `item`s) or the fused/foreach path on
+CUDA. No code change: torch's optimizer is not ours to patch.
+
+### 12.4 Churn (per step, dense, CPU)
+
+`aten::to` ~197, `as_strided` ~195, `copy_` ~142, `_to_copy` ~136, `transpose` ~122,
+`resolve_conj` ~108 — the view/copy tax of eager aten. With **0 graph breaks** these are
+exactly what inductor fuses, so the actionable item is `compile=True` on GPU (already the
+recommended config), not a source edit. On CPU each is sub-µs; python-side `cProfile` shows
+`train_step` at ~9 ms/step cumulative with no pathological branch in `forgemind/` — the hot
+frames are AdamW's per-parameter loop (§12.3 again).
+
+**Audit verdict: no unsafe if/else "speed killers" in this repo's code.** The structures the
+profiler was asked to check are intact: one stacked host read per step, zero dense graph
+breaks, MoE's breaks deliberate.
+
+### 12.5 `topk` (FlashTopK-inspired) and `softmax`
+
+Two new kernels under the standing rules (interpreter-tested, torch fallback, fullgraph,
+TileLens scenarios, kbench op):
+
+* **`fm.kernels.topk`** — strided-sample threshold (k-th of `m = min(n, max(2k, 256))`
+  samples; subset rule proves it never exceeds the true k-th) → exact pivot inside
+  `{x > t}` by k masked compound maxes → canonical (value desc, index asc) output, smallest
+  indices win ties, NaN treated as largest. 2 launches/row-program, `k ≤ 512` fused
+  (counted fallback beyond), scatter backward. Parity: 13 shape cases × multiset-exact vs
+  `torch.topk` + gather-self-check + tie order, all green under `TRITON_INTERPRET=1`;
+  grad parity exact on distinct values; `explain` → 1 graph / 0 breaks.
+* **`fm.kernels.softmax`** — three chunked passes (row max, exp+sum, scale); backward is
+  the closed form as tensor ops (compile-friendly, like `fused_linear`).
+
+**Bugs found while building them** (both caught by the interpreter tests before commit):
+
+| # | bug | symptom | fix |
+|---|---|---|---|
+| 1 | topk case-B kill tracked one position (`bpos`) that each iteration *overwrote*, resurrecting earlier kills | pivot off by iterations (k-th came back as 2nd) | carry the kill as "strictly worse than the last (value, index)" — one scalar pair encodes the whole history |
+| 2 | softmax had no chunk loop: one 1024-block per row | `n > 1024` left the row tail **uninitialized** (garbage 1e-41/1e30 outputs) | three-pass chunked loop over the row |
+
+### 12.6 TileLens (CPU, 3.1.1 + triton 3.6.0) — extended
+
+`tile-sanitizer tools/tilelens_probe.py` → **exit 0**, all prior scenarios still clean, plus
+`softmax(5x1000)` (masked tail), `softmax(4x4096)` (even path) and the topk **threshold**
+kernel (K1, standalone launch). **Known tool gap:** K2 (the select kernel) branches on a
+reduction (`if c >= k`), and TileLens's symbolic engine raises
+`NotImplementedError: Concretize for op sum` when a reduction feeds a Python bool — the
+probe prints an explicit `skip` line instead of crashing, and K2's correctness rests on the
+13-case interpreter parity suite instead. (First attempt at silencing this — moving
+reductions to `axis=0`/fp32 — was still insufficient: the failure is reduction→branch, not
+the dtype. Reductions *do* now consistently pass `axis=0`, matching `kl.py`/`norm.py`.)
+
+### 12.7 kbench (CPU only — no GPU in this sandbox)
+
+`kbench --ops topk,softmax --dim 128 --iters 3 --warmup 1 --allow-cpu`:
+
+| op | shape | eager | kernel | note |
+|---|---|---|---|---|
+| topk | [512, 32000] bf16 k=64 | 85.095 ms | 76.286 ms | CPU; fallback path≈ eager — **no speed claim** |
+| softmax | [8192, 128] bf16 | 2.568 ms | 2.446 ms | CPU; within noise of eager |
+
+`inductor=nan` env-wide (missing `Python.h`, §6). Speed gates stay GPU-only:
+`kbench --ops topk,softmax --check` on hardware decides wins; nothing here is claimed.

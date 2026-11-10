@@ -90,6 +90,34 @@ def main():
     go("newton_schulz(4x31x20, batched)",
        lambda t: fm.kernels.newton_schulz(t[0]), [b], backward=False)
 
+    # --- softmax: masked tail (n not a multiple of the block) and the even path ------------
+    sm = torch.randn(5, 1000)
+    go("softmax(5x1000, single tile)", lambda t: fm.kernels.softmax(t[0]), [sm])
+    sm2 = torch.randn(4, 4096)
+    go("softmax(4x4096, even)", lambda t: fm.kernels.softmax(t[0]), [sm2])
+
+    # --- topk threshold kernel (K1): no reduction-fed control flow, so the sanitizer runs it
+    from forgemind.kernels.topk import _topk_threshold_kernel as _k1
+    rows = torch.randn(3, 4096)
+    tthr = torch.empty(3, dtype=rows.dtype)
+    _k1[(3,)](tthr, rows, 4096, 64, 256, 16, 512, num_warps=4)
+    print("ok topk threshold K1(3x4096): sanitized standalone")
+
+    # --- topk select (K2): every case branches on a reduction (`if c >= k`), and TileLens'
+    #     symbolic engine cannot concretize reductions (NotImplementedError: op sum). Known
+    #     tool limit, recorded in PERF.md round seven; K1 above still gets sanitizer coverage.
+    try:
+        x = torch.randn(3, 4096)
+        go("topk(3x4096, k=64, strided sample)",
+           lambda t: fm.kernels.topk(t[0], 64), [x])
+        y = torch.randn(4, 300)
+        go("topk(4x300, k=97, case A + ties)", lambda t: fm.kernels.topk(t[0], 97), [y])
+        z = torch.randn(2, 512)
+        go("topk(2x512, k=512, full width)", lambda t: fm.kernels.topk(t[0], 512), [z])
+    except NotImplementedError as e:
+        print(f"skip topk select: tilelens cannot concretize reduction-fed branches ({e})")
+        print("                  known tool limit; threshold kernel sanitized above")
+
     save = os.environ.get("TILELENS_SAVE")
     if save:
         # Visualizer data path: archive the trace TileLens recorded (zip: manifest + tensors.npz)

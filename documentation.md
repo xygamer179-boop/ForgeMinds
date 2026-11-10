@@ -26,7 +26,7 @@ and why) is in [OFFLOAD.md](OFFLOAD.md).
    - [5.1 Train a GPT with `Trainer`](#51-train-a-gpt-with-trainer)
    - [5.2 Bring your own model with `Forge`](#52-bring-your-own-model-with-forge)
    - [5.3 Bring your own architecture](#53-bring-your-own-architecture)
-   - [5.4 Your own loop, Fabric-style](#54-your-own-loop-fabric-style)
+   - [5.4 Your own loop](#54-your-own-loop)
    - [5.5 Datasets and loading](#55-datasets-and-loading)
    - [5.6 Multi-GPU: layouts and how to prove them](#56-multi-gpu-layouts-and-how-to-prove-them)
    - [5.7 Memory: activation checkpointing and offload](#57-memory-activation-checkpointing-and-offload)
@@ -55,8 +55,7 @@ Three ways in, same guarantees underneath:
 | Entry point | For | You get |
 |---|---|---|
 | `fm.Trainer` | the `GPT`/`MoE` model in this repo, or any `nn.Module` that speaks the `(input_ids, labels) -> (ce, aux)` contract | the whole stack configured from one `ForgeConfig`: parallelism, quantization, offload, AC, compile, checkpoints, eval, logging |
-| `fm.Forge` | any `nn.Module`, any `DataLoader`, any loss | Lightning/Fabric-style `fit()` / `step()` / `backward()`, with the same one-sync-per-step and clipping discipline |
-| `fm.Fabric` | Lightning-Fabric code you want to run unchanged (modulo the import) | `setup` / `setup_dataloaders` / `backward` / `clip_gradients` / `save` / `load` / `seed_everything` / collectives, on this library's DDP, precision and launcher |
+| `fm.Forge` | any `nn.Module`, any `DataLoader`, any loss | `fit()` / `step()` / `backward()`, with the one-sync-per-step and clipping discipline |
 
 What the library deliberately optimises for: **the accelerator should never wait on the host.**
 That shows up as three concrete budgets you can check yourself ([§5.13](#513-measuring)):
@@ -417,7 +416,7 @@ fm.kernels.stats()                 # which path ran, and how often
 fm.kernels.use_custom_ops(True)    # force the torch.library path (export, AOTI, debugging)
 ```
 
-### 5.4 Your own loop, Fabric-style
+### 5.4 Your own loop
 
 ```python
 forge = fm.Forge(model, opt, precision="bf16", accum=8, quiet=True)
@@ -434,7 +433,7 @@ for batch in fm.async_loader(loader, forge.device, depth=2):
 `forge.step()` returns `ForgeState` (a `dict` with attribute access) on a completed optimizer step
 and `None` mid-accumulation — that is the contract `tests/forge_mp_check.py` relies on. `step(batch)`
 is the same thing with the forward/backward folded in. `forge.zero_grad()`, `forge.setup(model, opt)`
-and `forge.count_syncs()` exist for drop-in parity with Fabric-style code.
+and `forge.count_syncs()` round out the loop surface.
 
 Multi-process:
 
@@ -451,49 +450,31 @@ if __name__ == "__main__":
 `WORLD_SIZE > 1` is already in the environment, so the same script works under `torchrun`.
 The decorated function must be **module-level** (it has to be picklable).
 
-**`fm.Fabric` — the Lightning-Fabric API verbatim.** When the loop you have is a *Lightning*
-loop, `fm.Fabric` carries the same method names, argument order and return shapes as
-`lightning.fabric.Fabric`, backed by this library's machinery instead of Lightning's:
+**Runtime primitives — plain functions, no driver class.** The machinery a hand-written loop
+needs lives on `fm` itself (it used to sit on a Lightning-Fabric-shaped class; ForgeMind is
+not a port of Lightning, so the class is gone and its *useful parts* are embedded):
 
 ```python
-fabric = fm.Fabric(accelerator="auto", devices=2, strategy="ddp", precision="bf16-mixed")
-fabric.launch()                                       # spawn, or a no-op under torchrun
-model, optimizer = fabric.setup(model, optimizer)     # device + precision + DDP
-train_loader = fabric.setup_dataloaders(train_loader)  # batches arrive on the device
-
-for epoch in range(epochs):
-    for batch in train_loader:
-        optimizer.zero_grad()
-        with fabric.autocast():
-            loss = model(**batch)
-        fabric.backward(loss)
-        fabric.clip_gradients(model, optimizer, max_norm=1.0)
-        optimizer.step()
-    fabric.save("ckpt.pt", {"model": model, "optimizer": optimizer, "epoch": epoch})
+fm.seed_everything(1234, workers=False)     # torch + python + numpy; returns the seed
+fm.all_reduce(t, reduce_op="mean")          # in place: mean | sum | max | min
+fm.broadcast(t, src=0)                      # from rank src
+fm.all_gather(t)                            # dim-0 concatenation of every rank's copy
+fm.barrier()
 ```
 
-The contract, including where it *diverges* from Lightning:
+Every collective is a **passthrough at world 1** — no collective call at all — and returns
+the device tensor it was given, so the caller decides when to pay for a host sync (the
+one-sync-per-step budget is yours to keep). Under `fm.launch`, DDP wraps the model in the
+world the launcher built; a sharded `DataLoader` is the standard
+`torch.utils.data.DistributedSampler` (call `set_epoch` yourself each epoch), not an
+injected wrapper.
 
-* **precision** uses Lightning's names — `32-true`, `16-true`, `bf16-true`, `16-mixed`,
-  `bf16-mixed`. `*-true` casts the weights only (feed matching-dtype inputs); `*-mixed` keeps fp32
-  weights and autocasts, and `16-mixed` routes `backward`/`optimizer.step` through a
-  `GradScaler` on CUDA (no scaler on CPU).
-* **strategies** are `auto | single_device | ddp`. FSDP2, DeepSpeed, TP and PP are configured
-  through `Trainer`/`ForgeConfig`; asking `Fabric` for them raises a `ValueError` instead of
-  silently degrading to DDP.
-* **`clip_gradients`** returns the pre-clip total norm (Lightning returns `None`).
-* **`setup_dataloaders`** injects a `DistributedSampler` when the world is bigger than one (opt
-  out with `use_distributed_sampler=False`), moves batches to the device, and bumps the sampler
-  epoch automatically after each completed pass; `fabric.set_epoch(loader, n)` sets it explicitly.
-* **`save`/`load`** are rank-0 `torch.save` of plain state dicts with DDP unwrapped (checkpoints
-  never carry a `module.` prefix) — no sharded checkpoints; use `Trainer` for FSDP2/TP/PP state.
-* **`plugins=`** is rejected: this library has no plugin registry.
-* Collectives: `all_reduce` (`mean|sum|max|min`), `broadcast`, `all_gather` (concatenated on
-  dim 0), `barrier`; facts: `is_global_zero`, `world_size`, `global_rank`, `local_rank`, `device`.
-
-Verified single-process (every test in `tests/test_fabric.py`) and as a real 2-process DDP run
-(`tests/fabric_mp_check.py`: replicas bit-identical after four steps, rank-0 checkpoint restored
-on both ranks).
+`forge.save(path)` is rank-0: rank 0 writes, the other ranks wait at the barrier (under DDP
+every rank holds identical weights, so an unguarded multi-rank write is a race for zero
+benefit); `forge.load` reads it back on every rank with DDP unwrapped — no `module.`
+prefix. `tests/test_runtime.py` pins the world-1 behaviour of all of it, and
+`tests/forge_mp_check.py` runs the real thing: two processes, bit-identical replicas,
+`fm.all_gather` agreement and the rank-0 checkpoint restored on both ranks.
 
 ### 5.5 Datasets and loading
 
@@ -642,6 +623,22 @@ print(report.table())
 Batches are scored by **per-sample** cost: a bigger micro-batch usually costs the same wall time, so
 step-time scoring picks the smallest batch that fits. `python -m forgemind.autotune --kernels` sweeps
 Triton launch configurations instead.
+
+Two selection/normalization kernels sit outside the module patching, as plain callables:
+
+```python
+values, indices = fm.kernels.topk(x, 64)     # last dim; torch.topk drop-in, k <= 512 fused
+y = fm.kernels.softmax(logits)               # last dim; torch.softmax drop-in
+```
+
+`topk` follows FlashTopK's structure in portable Triton — strided-sample threshold (never
+above the true k-th), exact pivot inside `{x > t}`, canonical **value-descending /
+index-ascending** output so ties at the k-th score deterministically keep the smallest
+indices (which `torch.topk` does not promise), NaN treated as largest, scatter backward.
+`softmax` fuses max-sub + exp + sum + divide with the closed-form backward. Both fall back
+to torch while `torch.compile` traces (one aten node, `fullgraph=True` holds), on CPU/MPS,
+for unsupported dtypes, and — for `topk` — for `k > 512`; every fallback is counted in
+`fm.kernels.stats()`.
 
 ### 5.11 Checkpoint and resume
 
@@ -807,7 +804,7 @@ fm.Trainer(model_fn: Callable[[DistContext], nn.Module], cfg: ForgeConfig, train
 | `.epoch` / `.batches_in_epoch` | properties proxying the stream (exact mid-epoch position) |
 | `.raw` / `.model` / `.opt` / `.ctx` / `.history` / `.skipped` | model, wrapped model, optimizer, context, metrics, skip count |
 
-### Forge (Lightning/Fabric-style)
+### Forge
 
 ```python
 fm.Forge(model, optimizer=None, *, loss_fn=None, device=None, precision="bf16", accum=1, clip=1.0,
@@ -824,8 +821,8 @@ fm.Forge(model, optimizer=None, *, loss_fn=None, device=None, precision="bf16", 
 | `.step(batch=None) -> ForgeState \| None` | one micro-batch; `None` while accumulating |
 | `.backward(loss)` | accumulation-scaled backward |
 | `.evaluate(loader, max_batches=None) -> float` | mean loss, no grad, prefetched |
-| `.save(path)` / `.load(path)` | single-file checkpoint (model, opt, sched, step, RNG) |
-| `.setup(model, opt)` | Fabric-compatible `model, opt = forge.setup(model, opt)` |
+| `.save(path)` / `.load(path)` | single-file checkpoint (model, opt, sched, step, RNG); rank 0 writes, the others wait at the barrier |
+| `.setup(model, opt)` | returns `(model, opt)` — the stored ones for anything omitted |
 | `.zero_grad(set_to_none=True)`, `.count_syncs()` | passthroughs |
 | `.history` / `.step_count` / `.device` / `.raw_model` | state |
 
@@ -835,30 +832,23 @@ fm.launch(fn=None, nproc=1, port=29517)
 Decorator (or direct call). Spawns `nproc` processes unless `WORLD_SIZE > 1` is already set, in
 which case it runs `fn` once inside the existing world. The function must be module-level.
 
-### Fabric (Lightning-Fabric-compatible)
+### Runtime primitives (module-level)
 
 ```python
-fm.Fabric(accelerator="auto", devices=1, strategy="auto", precision="32-true", *,
-          plugins=None, port=29517)
-# accelerator: "auto" | "cpu" | "cuda"; devices: "auto" | int | list[int]
-# strategy:    "auto" | "single_device" | "ddp"   (others raise)
-# precision:   "32-true" | "16-true" | "bf16-true" | "16-mixed" | "bf16-mixed"
+fm.seed_everything(seed=1234, workers=False) -> int
+fm.all_reduce(tensor, reduce_op="mean") -> tensor      # mean | sum | max | min, in place
+fm.broadcast(tensor, src=0) -> tensor
+fm.all_gather(tensor) -> tensor                        # dim-0 concatenation of world copies
+fm.barrier() -> None
 ```
 
-| member | description |
-|---|---|
-| `.launch(fn=None, *args, **kwargs)` | run `fn` (module-level when spawned) on `devices` processes; returns `self` without `fn` |
-| `.setup(module, *optimizers)` | device + precision + DDP; returns what you passed, same arity |
-| `.setup_dataloaders(*loaders, use_distributed_sampler=True)` | device-moving wrappers (+ `DistributedSampler` when sharded) |
-| `.autocast()` | the precision context for the forward |
-| `.backward(loss)` | backward (GradScaler under `16-mixed` on CUDA) |
-| `.clip_gradients(module, optimizer, max_norm, error_if_nonfinite=False)` | clip in place; returns the pre-clip norm |
-| `.to_device(data)` / `.set_epoch(loader, epoch)` | batch movement / explicit sampler epoch |
-| `.save(path, state)` / `.load(path, state, )` | rank-0 `torch.save`; modules/optimizers as state dicts, DDP unwrapped |
-| `.seed_everything(seed=1234, workers=False) -> int` | torch + python + numpy |
-| `.all_reduce(t, reduce_op="mean")` / `.broadcast(t, src=0)` / `.all_gather(t)` / `.barrier()` | collectives (no-ops at world 1) |
-| `.is_global_zero` / `.world_size` / `.global_rank` / `.local_rank` / `.device` | facts |
-| `.precision` / `.strategy` / `.accelerator` / `.repr` | configuration |
+Plain functions on the package (no driver class): at world 1 — or with no process group at
+all — every collective is a passthrough that returns the *same tensor* without calling into
+`torch.distributed`, and `all_reduce` validates `reduce_op` before the passthrough so typos
+fail fast on every rank. `seed_everything` seeds torch/python/numpy (plus
+`PYTHONHASHSEED` when `workers=True`) and returns the seed. Covered by
+`tests/test_runtime.py` (world-1 contract) and `tests/forge_mp_check.py` (real 2-process
+`all_gather` + rank-0 `forge.save`/`forge.load`).
 
 ### Muon (optimizer)
 
@@ -1166,7 +1156,7 @@ These are enforced by tests, not just intentions.
 
 ## 11. Verified vs not verified
 
-Verified on CPU/gloo in this repository (`pytest tests/`, 201 tests — and 218 with
+Verified on CPU/gloo in this repository (`pytest tests/`, 218 tests — and 236 with
 `TRITON_INTERPRET=1`, where the real kernels run inside the test suite too):
 
 * dense and MoE training, gradient accumulation, checkpoint + resume;
@@ -1185,12 +1175,13 @@ Verified on CPU/gloo in this repository (`pytest tests/`, 201 tests — and 218 
 * the `newton_schulz` kernels through **TileLens** as well (0 findings; a planted
   out-of-bounds in the update kernel aborts the sanitizer, proving the NS kernels are
   instrumented) and through `kbench`'s op table;
-* the `Fabric` driver: precision mapping, `clip_gradients`, sampler-epoch contract, save/load
-  round-trip, and a real 2-process DDP run (bit-identical replicas, rank-0 checkpoint restored
-  on both ranks);
-* the six kernels through **TileLens** (formerly Triton-Viz) on CPU: symbolic out-of-bounds
-  sanitizer (0 findings, tool validated against a planted bug), race detector, and the profiler's
-  mask/loop tables — see [PERF.md §10](PERF.md);
+* the eight packed kernels plus `newton_schulz`, `topk` and `softmax` through **TileLens**
+  (formerly Triton-Viz) on CPU: symbolic out-of-bounds sanitizer (0 findings, tool validated
+  against a planted bug), race detector, and the profiler's mask/loop tables — see
+  [PERF.md §10](PERF.md) and [PERF.md §12](PERF.md#12-round-seven-profiler-audit--topk--softmax);
+* the embedded runtime primitives: world-1 passthrough collectives, `seed_everything`
+  reproducibility, rank-0 `forge.save` guarded by a barrier, and a real 2-process DDP run
+  (bit-identical replicas, `fm.all_gather` agreement, checkpoint restored on both ranks);
 * autotuning (batch-size search, OOM handling, report shape);
 * the asynchronous batch pipeline: order, epoch bookkeeping, overlap timing, error forwarding,
   resume, thread/worker cleanup, rank alignment;
@@ -1239,8 +1230,7 @@ PP stages; experts not TP'd or quantized; optimizer offload not for FSDP/PP; no 
 | path | contents |
 |---|---|
 | `forgemind/trainer.py` | `Trainer`: config → mesh → quant → TP → AC → compile → DP → pipeline, optimizer, data, step, eval, checkpoint |
-| `forgemind/forge.py` | `Forge` façade and `launch` |
-| `forgemind/fabric.py` | `Fabric`: the Lightning-Fabric-compatible driver (setup/precision/DDP/collectives/checkpoints) |
+| `forgemind/forge.py` | `Forge` façade, `launch`, `seed_everything`, rank-0 `save` |
 | `forgemind/muon.py` | `Muon`: Muon (spectral-norm momentum + batched Newton-Schulz) for matrices, AdamW for vectors |
 | `forgemind/data.py` | datasets, `ResumableSampler`, `BatchStream`, `async_loader`, `to_device`, `build_loader` |
 | `forgemind/config.py` | `ForgeConfig` and the four sub-configs |
@@ -1250,13 +1240,13 @@ PP stages; experts not TP'd or quantized; optimizer offload not for FSDP/PP; no 
 | `forgemind/quant.py` | quantized training (TE fp8, torchao int8) and the 8-bit optimizer |
 | `forgemind/offload.py` | `OffloadedAdamW`, activation offload, pinned buffer pooling |
 | `forgemind/perf.py` | host-sync counting, `warn_once`, fast-math defaults, pinned pool |
-| `forgemind/kernels/` | Triton kernels (including `ns.py`, the Newton-Schulz step behind `fm.Muon`), torch fallbacks, `apply.patch()` / `apply.enable()` |
+| `forgemind/kernels/` | Triton kernels (`ns.py` Newton-Schulz, `topk` FlashTopK-style selection, `softmax`), torch fallbacks, `apply.patch()` / `apply.enable()` |
 | `forgemind/nn.py` | composable blocks: `RMSNorm` (with fused residual), `SwiGLU` (dense or fused gate\|up) |
 | `forgemind/autotune.py` | `apply_fast_defaults`, `tune_batch_size`, `autotune`, kernel sweep |
-| `forgemind/distributed.py`, `forgemind/loss.py` | mesh/groups init, chunked CE/KL losses |
+| `forgemind/distributed.py`, `forgemind/loss.py` | mesh/groups init, module-level collectives (`all_reduce`/`broadcast`/`all_gather`/`barrier`), chunked CE/KL losses |
 | `forgemind/cli/` | `bench.py`, `matrix.py`, `__main__` |
 | `examples/train_gpt.py` | runnable GPT/MoE training script with the full flag set |
-| `tests/` | unit suite plus `mp_check.py`, `forge_mp_check.py`, `fabric_mp_check.py`, `muon_mp_check.py`, `kernel_interp_check.py` |
+| `tests/` | unit suite plus `mp_check.py`, `forge_mp_check.py`, `muon_mp_check.py`, `kernel_interp_check.py` |
 | `documentation.md` | this file: guide, API/config reference, troubleshooting, verified/unverified matrix |
 | `PERF.md` | the performance audit: stall sites, graph breaks, both measurement rounds, bug tables |
 | `OFFLOAD.md` | offload design and rejected alternatives |
@@ -1265,7 +1255,9 @@ Test files by concern: `test_single.py` (trainer basics), `test_edge_cases.py`, 
 (sync budget), `test_compile.py` (graph breaks), `test_forge.py`, `test_async_batches.py` (data
 pipeline), `test_offload.py`, `test_kernels.py`, `test_kernel_ops.py` (the `torch.library` op path:
 eager-vs-op equality, `fullgraph`, export), `test_kernel_bench.py` (the `kbench` harness),
-`test_fabric.py` (the Lightning-Fabric driver: precision, DDP, sampler epochs, checkpoints),
+`test_runtime.py` (the embedded collectives, `seed_everything`, rank-0 save),
+`test_topk.py` / `test_softmax.py` (the selection and softmax kernels: multiset parity,
+canonical ties, NaN, autograd, `fullgraph`),
 `test_muon.py` (the Muon optimizer and the NS kernel: reference parity, the found-bug
 regressions, bucketed batching, compile dispatch, subprocess mp check), `test_autotune.py`, `test_ds_config.py`
 (DeepSpeed config generation), `test_nn_blocks.py` (the blocks and `patch` are drop-in

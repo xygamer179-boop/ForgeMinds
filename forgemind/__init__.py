@@ -1,5 +1,6 @@
 from .config import ForgeConfig, ParallelConfig, QuantConfig, OffloadConfig, TrainConfig
-from .distributed import init_distributed, DistContext, cleanup
+from .distributed import (init_distributed, DistContext, cleanup,
+                         all_reduce, all_gather, broadcast, barrier)
 from .trainer import Trainer, moe_kwargs
 from .models import GPT, GPTConfig
 from .moe import MoE
@@ -7,10 +8,9 @@ from .offload import OffloadedAdamW
 from .data import (SyntheticLM, TokenFile, BatchStream, ResumableSampler, build_loader,
                    async_loader, to_device)
 from .perf import count_host_syncs, host_syncs
-from .forge import Forge, launch
-from .fabric import Fabric
+from .forge import Forge, launch, seed_everything
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 
 def __getattr__(name):
@@ -35,5 +35,6 @@ __all__ = [
     "SyntheticLM", "TokenFile", "BatchStream", "ResumableSampler", "build_loader",
     "async_loader", "to_device",
     "count_host_syncs", "host_syncs",
-    "Forge", "launch", "Fabric", "Muon",
+    "Forge", "launch", "seed_everything", "Muon",
+    "all_reduce", "all_gather", "broadcast", "barrier",
 ]
