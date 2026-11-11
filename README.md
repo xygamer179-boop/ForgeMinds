@@ -28,7 +28,7 @@ kernels fall back to torch with identical numerics.
 ```bash
 torchrun --nproc_per_node=4 examples/train_gpt.py --moe --dp-replicate 4 --ep 2
 torchrun --nproc_per_node=4 examples/train_gpt.py --tp 2 --dp-shard 2
-pytest tests/               # 201 tests: trainer, parallel, kernels, forge, async batches, autotune, offload, muon
+pytest tests/               # 218 tests: trainer, parallel, kernels, topk/softmax, forge, runtime, autotune, offload, muon
 torchrun --standalone --nproc_per_node=2 tests/mp_check.py ep_equiv   # also ddp, fsdp, pp, tp, prefetch, ...
 ```
 
@@ -59,7 +59,7 @@ The model factory receives the `DistContext`, so it can size itself per rank. A 
 
 ## Your own model, two lines
 
-`Forge` is the Lightning/Fabric-style façade: any `nn.Module`, any `DataLoader`, and it keeps the
+`Forge` is the two-line façade: any `nn.Module`, any `DataLoader`, and it keeps the
 guarantees this library is built on (one host sync per step, device-side clipping, accumulation, DDP).
 
 ```python
@@ -68,7 +68,7 @@ import forgemind as fm
 forge = fm.Forge(model, optimizer, loss_fn=criterion, precision="bf16", accum=4)
 forge.fit(loader, max_steps=1000)
 
-# or keep your own loop, Fabric-style:
+# or keep your own loop:
 loss = criterion(model(**batch), batch["labels"])
 forge.backward(loss)
 forge.step()          # ForgeState on an optimizer step, None while accumulating
@@ -85,41 +85,44 @@ main()                # module-level function; works unchanged under torchrun
 
 Mesh: world = pp * dp_replicate * dp_shard * tp; `ep` divides the DP world.
 
-## Lightning-Fabric-style loop
+## Your loop, with the runtime primitives
 
-`fm.Fabric` is the same machinery under **Lightning-Fabric's names** — a port is mostly an import
-swap. You keep the loop; the driver owns device movement, precision, DDP, collectives and
-checkpoints:
+When you keep the loop yourself, the machinery is plain functions on `fm` -- collectives,
+seeding, checkpoints. There is no driver class to learn, because ForgeMind is not a port of
+Lightning; `Forge` already owns device movement, precision, DDP and the one-sync-per-step
+discipline for the two-line case:
 
 ```python
 import forgemind as fm
 
-fabric = fm.Fabric(accelerator="auto", devices=2, strategy="ddp", precision="bf16-mixed")
-fabric.launch()                                      # spawns; a no-op under an existing torchrun
-model, optimizer = fabric.setup(model, optimizer)    # device + precision + DDP wrap
-train_loader = fabric.setup_dataloaders(train_loader)  # batches arrive on the device
+fm.seed_everything(1234)                    # torch + python + numpy (+ PYTHONHASHSEED with workers=True)
 
-for epoch in range(epochs):
-    for batch in train_loader:
-        optimizer.zero_grad()
-        with fabric.autocast():
-            loss = model(**batch)
-        fabric.backward(loss)                        # fp16 GradScaler handled for 16-mixed
-        fabric.clip_gradients(model, optimizer, max_norm=1.0)
-        optimizer.step()
-    fabric.save("ckpt.pt", {"model": model, "optimizer": optimizer, "epoch": epoch})
+@fm.launch(nproc=2)                        # spawns; a no-op under an existing torchrun
+def main():
+    for epoch in range(epochs):
+        if hasattr(loader, "sampler") and hasattr(loader.sampler, "set_epoch"):
+            loader.sampler.set_epoch(epoch)   # DistributedSampler: reshuffle per epoch
+        for batch in loader:
+            ...                            # your forward / backward / optimizer.step
+        grads = torch.cat([p.grad.reshape(-1) for p in model.parameters()])
+        fm.all_reduce(grads, reduce_op="mean")   # world 1: returns `grads` untouched
+        fm.barrier()
+    forge.save("ckpt.pt")                  # rank 0 writes; the other ranks wait at the barrier
 ```
 
-Precision names are Lightning's (`32-true`, `16-true`, `bf16-true`, `16-mixed`, `bf16-mixed`);
-also `seed_everything`, `all_reduce` / `broadcast` / `all_gather` / `barrier`, `to_device`,
-`set_epoch`, and the `is_global_zero` / `world_size` / `global_rank` properties. Strategies are
-`auto | single_device | ddp` — FSDP2, DeepSpeed, TP and PP belong to `Trainer`/`ForgeConfig`, and
-asking `Fabric` for them **raises** rather than silently degrading. Checkpoints are plain
-`torch.save` on rank 0 with DDP unwrapped (no `module.` prefix).
+The collectives are `fm.all_reduce` (`mean|sum|max|min`), `fm.broadcast`, `fm.all_gather`
+(concatenated on dim 0) and `fm.barrier` -- every one a **passthrough at world 1** (no
+collective call at all), returning device tensors so you decide when to pay for a host
+sync. `forge.save` guards itself: under DDP every rank holds identical weights, so letting
+all of them write the same file is a race for zero benefit. Checkpoints are plain
+`torch.save` with DDP unwrapped (no `module.` prefix); sharded samplers are the standard
+`torch.utils.data.DistributedSampler`, not an injected wrapper.
 
-Three shapes, one library: **`Trainer`** owns the whole loop, **`Forge`** is the two-line facade,
-**`Fabric`** is the loop you write yourself with Lightning's method names. Verified single-process
-and 2-process DDP (`tests/test_fabric.py`, `tests/fabric_mp_check.py`).
+Three shapes, one library: **`Trainer`** owns the whole loop, **`Forge`** is the two-line
+façade, and the primitives above are for the loop you write yourself. Verified
+single-process and as a real 2-process DDP run (`tests/test_runtime.py`,
+`tests/forge_mp_check.py`: bit-identical replicas, `fm.all_gather` agreement, rank-0
+checkpoint restored on both ranks).
 
 ## Bring your own architecture
 
@@ -205,8 +208,7 @@ torchrun --standalone --nproc_per_node=2 tests/mp_check.py ddp     # ddp, ddp_ac
 torchrun --standalone --nproc_per_node=2 tests/mp_check.py tp      # fsdp_accum, ep_ddp, pp, tp, tp_fsdp,
 torchrun --standalone --nproc_per_node=4 tests/mp_check.py 3d      # pp_fsdp, 3d, 3d_full, ep_equiv,
 torchrun --standalone --nproc_per_node=2 tests/mp_check.py prefetch # tp_equiv, pp_equiv, prefetch
-python tests/forge_mp_check.py                                     # Forge + launch across 2 processes
-python tests/fabric_mp_check.py                                    # Fabric + DDP across 2 processes
+python tests/forge_mp_check.py                                     # Forge + DDP + rank-0 ckpt, 2 processes
 python tests/muon_mp_check.py                                      # Muon + DDP across 2 processes
 ```
 
@@ -215,8 +217,10 @@ python tests/muon_mp_check.py                                      # Muon + DDP 
 `fm.kernels` has fused Triton kernels for the ops that are usually *several* eager kernels:
 `rms_norm`, `add_rms_norm` (residual+norm in one pass), `qk_norm_rope` (per-head norm + RoPE),
 `swiglu` / `swiglu_split` (fused gate|up projection epilogue), a distillation KL that
-computes the logit gradient in the forward pass, and `newton_schulz` (the quintic
-orthogonalization that gives `fm.Muon` its spectral-norm steps). Every one is a drop-in for the eager expression,
+computes the logit gradient in the forward pass, `newton_schulz` (the quintic
+orthogonalization that gives `fm.Muon` its spectral-norm steps), `topk` (FlashTopK-inspired
+exact selection: strided-sample threshold, canonical value-desc/index-asc order, smallest
+indices win ties) and `softmax` (one kernel: max-sub, exp, sum, divide). Every one is a drop-in for the eager expression,
 degrades to torch on CPU/MPS, and is verified against the torch reference by running the *actual
 kernels* through `TRITON_INTERPRET=1` on CPU (`tests/test_kernels.py`, 66 numeric checks).
 
@@ -232,10 +236,10 @@ traced each kernel is a `torch.library.custom_op` with a fake implementation and
 backward, so it stays **inside** the graph (`fullgraph=True`) and `torch.export` captures it —
 which is what an AOTInductor serving stack needs. Same launch either way, bit-identical numbers.
 
-`newton_schulz` is the one kernel that is *not* a `custom_op`: it runs under `no_grad` inside
-`Optimizer.step`, so tracing simply uses the pure-torch path (dynamo sees ordinary ops), while
-eager fuses each iteration's five elementwise ops down to two Triton kernels with the GEMMs
-staying in cuBLAS.
+`newton_schulz`, `topk` and `softmax` are *not* `custom_op`s: the first runs under `no_grad`
+inside `Optimizer.step`, the other two substitute `torch.topk` / `aten::softmax` while a graph
+is traced (one aten node, `fullgraph=True` holds), while eager still takes the Triton path.
+`stats()` counts every fallback, including `topk`'s `k > 512` limit.
 
 ```bash
 python -m forgemind.cli kbench --check   # per-op A/B/C vs inductor on your GPU; exit 3 if we lose
@@ -325,7 +329,7 @@ print(trainer.feed.report())       # batch pipeline: wait_ms_per_batch, stalled,
 | every function and its signature | [documentation.md §6](documentation.md#6-api-reference) |
 | every config field and its default | [documentation.md §7](documentation.md#7-configuration-reference) |
 | the kernel API | [documentation.md §8](documentation.md#8-kernels-reference) |
-| a Lightning-Fabric port | [documentation.md §5.4](documentation.md#54-your-own-loop-fabric-style) |
+| writing your own loop (collectives, seed, checkpoints) | [documentation.md §5.4](documentation.md#54-your-own-loop) |
 | a Muon optimizer | [documentation.md §5.14](documentation.md#514-muon-one-optimizer-for-the-whole-model) |
 | CLI flags (`bench`, `matrix`, `autotune`, examples, checks) | [documentation.md §9](documentation.md#9-command-line-reference) |
 | what is guaranteed, and what is *not* verified | [documentation.md §10–11](documentation.md#10-guarantees-and-invariants) |
@@ -348,13 +352,14 @@ The rest (quantization backends, offload+PP, empty `evaluate()`, OOM tuning) is 
 
 ## Status
 
-Verified on CPU/gloo (see `tests/`, 201 tests): dense/MoE training, grad accumulation, checkpoint+resume,
+Verified on CPU/gloo (see `tests/`, 218 tests): dense/MoE training, grad accumulation, checkpoint+resume,
 offload optimizer equivalence (and the chunked/pipelined path), AC modes, DDP/FSDP2/HSDP/TP/PP/3D, EP
 equivalence, `torch.compile` (`aot_eager`) with `fullgraph=True` and eager-gradient equivalence, the
 packed Triton kernels run through Triton's CPU interpreter (forward *and* backward vs torch) **and**
 through TileLens (formerly Triton-Viz): symbolic memory sanitizer, race detector and profiler across
-all six kernels (see [PERF.md §10](PERF.md)), the `Forge` façade and the `Fabric` driver (both with a
-2-process DDP launch), `fm.Muon` (reference parity, the six fixed reference bugs as regression tests,
+all eight packed kernels (see [PERF.md §10](PERF.md)) plus `newton_schulz`, `topk` and `softmax`
+(TileLens scenarios + interpreter parity), the `Forge` façade and the runtime primitives (2-process
+DDP launch covering `fm.all_gather` and rank-0 save/load), `fm.Muon` (reference parity, the six fixed reference bugs as regression tests,
 a 2-process DDP check), autotuning, the asynchronous batch pipeline (order,
 overlap, rank alignment, resume, thread/worker cleanup), and a one-host-sync-per-step budget.
 

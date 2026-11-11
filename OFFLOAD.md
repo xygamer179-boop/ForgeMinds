@@ -107,3 +107,79 @@ The remaining roadmap items that need an accelerator to evaluate honestly are: N
 reduce-scatter into pinned host memory (§4), bf16 moments (§3), and activation packing (§5).
 They are left out rather than shipped untested — the same rule this library applies to
 `torch._grouped_mm`, DeepSpeed and FP8.
+
+---
+
+## 8. Automatic selection (design — not implemented)
+
+Sections 2–7 each pick *one* lever. The open question is who moves the levers: today it is
+the human reading `OffloadConfig`. This section sketches a controller that picks for you —
+cost model first, telemetry second, and a hard rule that it may never add a host sync to a
+step (the one-sync budget in §1 is load-bearing).
+
+**The signal.** `torch.cuda.mem_get_info()` returns `(free, total)` from the driver — a
+cheap query, no device sync, safe to call at a step boundary every *N* steps (say, 50).
+One number is not enough to act on: `free` conflates weights, activations, fragmentation
+and the caching allocator's reserved-but-idle blocks, so the controller treats it as a
+*trend* signal (slope over a window), never as an instant trigger.
+
+**Hysteresis, always.** Two thresholds and a dwell time, or the system thrashes:
+
+```
+free < low  (e.g. 15% of total) for ≥ D steps  →  move to the next-smaller resident set
+free > high (e.g. 30% of total) for ≥ D steps  →  move back
+min dwell between transitions ≥ D steps        →  no policy flip-flops within a window
+```
+
+The asymmetry (low ≠ high) is the point: every transition costs a full weight transfer in
+each direction, so a policy that oscillates is strictly worse than either static policy.
+`D` absorbs allocator noise (grad freeing, activation peaks at layer boundaries).
+
+**Cost model under a memory budget.** For each candidate resident set *S* (which modules
+keep weights on the device):
+
+```
+peak(S)  = resident_weights(S) + activations + workspace + safety_margin
+time(S)  = compute + Σ bytes_moved(S) / bw          (overlap-aware: per §1, T ≈ max(compute, transfer))
+choose S* = argmin time(S)  subject to  peak(S) ≤ budget
+```
+
+Two terms are calibrated online rather than assumed: `bw` is measured with a probe
+H2D/D2H of a known buffer every K steps (PCIe varies with contention), and `compute` is
+the EMA of the last N step times. The search itself is greedy, not a solver: rank modules
+by *bytes freed per µs of added transfer* and take from the top until the budget holds —
+module sizes are known statically, transfer cost is linear in bytes, and the greedy order
+is exactly what a knapsack relaxation would pick anyway.
+
+**Prefetch scheduling.** While module *k* computes, H2D module *k+1* on a side stream —
+the same double-buffering shape as `pipeline_chunks` (§1), but for weights. Rules:
+
+* issue copies only for the *next* module in execution order (look-ahead of 1–2), never
+  speculative beyond the resident set;
+* record a CUDA event per copy and `wait` it at the first use — events are stream-side,
+  **no host sync**, so the one-sync budget is untouched;
+* only prefetch when telemetry says the copy queue is empty and the destination is already
+  allocated (prefetching into memory the allocator must grow for is how a controller makes
+  things worse).
+
+**Recompute vs offload — a decision table, not a single rule.** The break-even for a tensor
+class is `flops_per_byte > bw / flops_rate`: recompute pays compute, offload pays bytes.
+
+| tensor class | verdict | why |
+|---|---|---|
+| optimizer state | **offload (shipped, §1)** | zero flops, streamed anyway, the host has the memory |
+| gradients | **stream (shipped)** | already D2H once per step; chunked, §1 |
+| activations | **recompute** | attention blocks are byte-heavy, flops-light per byte → recompute wins almost always; §5's D2H staging stays rejected until pinned+async is evaluated on hardware |
+| weights | **offload only if `peak > budget`** | on-device is always fastest; this is the knob the controller owns |
+
+**Emergency tier.** On `torch.cuda.OutOfMemoryError`: drop to the smallest resident set,
+`empty_cache`, retry the step once. A retry is a policy miss — count it, surface it in
+`opt.report()`-style stats, and let it feed the controller (a persistent miss rate means
+the budget model is mis-calibrated). This is the only place the controller is allowed to
+be reactive; everything else is predictive.
+
+**Honest status: 🔜 design only.** None of it can be validated on this box (no GPU, and
+`mem_get_info` is meaningless on CPU), so nothing here ships untested — the same rule as
+§4–§5. What the repo *does* provide as prerequisites: the one-sync step budget the
+controller must respect, `pipeline_chunks` events as the copy/overlap machinery, and
+`OffloadConfig` as the static policy the dynamic one would wrap rather than replace.
