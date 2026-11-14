@@ -1,6 +1,6 @@
 # ForgeMind documentation
 
-Reference and guide for **forgemind 0.7.0** — a PyTorch training library with FSDP2/HSDP/DDP,
+Reference and guide for **forgemind 0.9.0** — a PyTorch training library with FSDP2/HSDP/DDP,
 tensor/pipeline/expert parallelism, DeepSpeed ZeRO, FP8/INT8 quantized training, gradient /
 activation / expert offload, MoE, packed Triton kernels, device autotuning, an asynchronous batch
 pipeline, and two levels of trainer API.
@@ -72,6 +72,9 @@ That shows up as three concrete budgets you can check yourself ([§5.13](#513-me
 ## 2. Install and requirements
 
 ```bash
+pip install git+https://github.com/xygamer179-boop/ForgeMinds.git   # straight from GitHub
+# or fetch forgeminds-0.9.0.zip from the Releases page, then:
+# pip install ./forgeminds-0.9.0.zip
 pip install -e .                 # core: torch>=2.6, numpy (Python >= 3.10)
 pip install -e ".[kernels]"      # + triton, for the packed kernels
 pip install -e ".[torchao]"      # + torchao (INT8 training, AdamW8bit)
@@ -1023,6 +1026,8 @@ fm.kernels.kl_distill_loss(hs, ht, w, teacher_head, chunk=4096)   # KL on logits
 fm.kernels.kl_div_logits(student, teacher, reduction="mean", grad_dtype=None)
 fm.kernels.kl_div(student, teacher, reduction="mean", grad_dtype=None)
 fm.kernels.newton_schulz(g, steps=5, dtype=None, fused=True)  # batched (..., m, n) -> same shape, Muon's polar step
+fm.kernels.topk(x, k, dim=-1, sorted=True) -> (values, indices)  # last dim; canonical ties, k <= 512 fused
+fm.kernels.softmax(x, dim=-1, dtype=None)                        # last dim; fused, closed-form backward
 
 fm.kernels.enable(model, norm=True, swiglu_mlp=True, split=False)  # patch a whole tree in place
 fm.kernels.patch(module, split=False, kind=None) -> bool     # one module; False = not recognised
@@ -1058,6 +1063,12 @@ non-contiguous inputs, `dim=1` RMSNorm, odd `head_dim`, bf16 gradients and `V=50
 In eager the kernels still go through `torch.autograd.Function`: a custom op costs ~59 µs/call of
 Python against ~24 µs for `Function.apply`, which would be a real regression for small tensors, so the
 op path is entered only where that overhead is amortised — inside a compiled graph.
+
+**`topk` and `softmax` are not custom ops either.** While a graph is tracing they substitute
+plain `torch.topk` / `aten::softmax` (one aten node each, so `fullgraph=True` holds); eager keeps
+the Triton path, and `stats()` counts every fallback — including `topk`'s `k > 512` and
+`n > 2**24` guards. `topk` follows FlashTopK's structure (strided-sample threshold → exact pivot →
+canonical value-desc/index-asc order, smallest indices win ties, NaN treated as largest).
 
 **`newton_schulz` is deliberately not a custom op.** It is an optimizer utility called under
 `no_grad`, so there is nothing to differentiate; while `torch.compile` traces it, it simply runs
@@ -1175,10 +1186,11 @@ Verified on CPU/gloo in this repository (`pytest tests/`, 218 tests — and 236 
 * the `newton_schulz` kernels through **TileLens** as well (0 findings; a planted
   out-of-bounds in the update kernel aborts the sanitizer, proving the NS kernels are
   instrumented) and through `kbench`'s op table;
-* the eight packed kernels plus `newton_schulz`, `topk` and `softmax` through **TileLens**
-  (formerly Triton-Viz) on CPU: symbolic out-of-bounds sanitizer (0 findings, tool validated
-  against a planted bug), race detector, and the profiler's mask/loop tables — see
-  [PERF.md §10](PERF.md) and [PERF.md §12](PERF.md#12-round-seven-profiler-audit--topk--softmax);
+* all nine kernels (eight packed incl. `topk`/`softmax`, plus `newton_schulz`) through
+  **TileLens** (formerly Triton-Viz) on CPU: symbolic out-of-bounds sanitizer (0 findings,
+  tool validated against a planted bug), race detector, and the profiler's mask/loop tables —
+  see [PERF.md §10](PERF.md) and [PERF.md §12](PERF.md#12-round-seven-profiler-audit--topk--softmax)
+  (topk's select stage excepted: reduction-fed branches hit a documented tool gap);
 * the embedded runtime primitives: world-1 passthrough collectives, `seed_everything`
   reproducibility, rank-0 `forge.save` guarded by a barrier, and a real 2-process DDP run
   (bit-identical replicas, `fm.all_gather` agreement, checkpoint restored on both ranks);
