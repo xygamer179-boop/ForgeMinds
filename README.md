@@ -379,9 +379,9 @@ OffloadedAdamW not for FSDP/PP; no eval under PP.
 
 | version | shipped |
 |---|---|
-| **0.9.0** | profiler audit ([PERF.md §12](PERF.md#12-round-seven-profiler-audit--topk--softmax), `tools/profile_audit.py`), `fm.kernels.topk` (FlashTopK-style exact selection) + `fm.kernels.softmax`, the automatic-selection design in [OFFLOAD.md §8](OFFLOAD.md#8-automatic-selection-design--not-implemented), and `fm.Fabric` removed with its machinery embedded as plain functions (collectives, `seed_everything`, rank-0 `Forge.save`) |
+| **0.9.0** | profiler audit ([PERF.md §12](PERF.md#12-round-seven-profiler-audit--topk--softmax), `tools/profile_audit.py`), `fm.kernels.topk` (FlashTopK-style exact selection) + `fm.kernels.softmax`, the automatic-selection design in [OFFLOAD.md §8](OFFLOAD.md#8-automatic-selection-design--not-implemented), and the `Fabric` driver removed with its machinery embedded as plain functions (collectives, `seed_everything`, rank-0 `Forge.save`) |
 | 0.8.0 | `fm.Muon` + fused `newton_schulz`; the six reference-optimizer bugs kept as regression tests |
-| 0.7.0 | TileLens sanitizer/profiler/race integration on the kernels (the `fm.Fabric` driver arrived here and was removed in 0.9.0) |
+| 0.7.0 | TileLens sanitizer/profiler/race integration on the kernels (the Fabric driver arrived here and was removed in 0.9.0) |
 | 0.6.0 | kernel-bug and sync-budget audit rounds, docs contract tests |
 
 Release zips are attached to each tag on the [Releases page](../../releases) — e.g.
