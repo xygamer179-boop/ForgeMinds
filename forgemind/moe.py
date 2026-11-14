@@ -18,7 +18,7 @@ a guaranteed graph break under `torch.compile`. A static-shape `scatter_add_` do
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -114,16 +114,12 @@ class Experts(nn.Module):
     # ---- fast path: no host sync, fully traceable ------------------------------------------------
     def forward(self, x, counts=None, offsets=None):
         """``offsets`` = int32 cumulative group ends on the device (grouped path, no host sync).
-        ``counts``  = python list of per-expert sizes (eager path)."""
+        ``counts``  = per-expert sizes: a device tensor *or* a python list (eager path). The
+        host conversion happens inside the disabled `_forward_eager`, so the traced region
+        never touches a data-dependent scalar (torch >= 2.11 breaks on `.tolist()` there)."""
         if self.grouped and offsets is not None and x.is_cuda and x.dtype == torch.bfloat16:
             return self._forward_grouped(x, offsets)
-        if counts is None:
-            if offsets is None:
-                counts = [x.size(0)]
-            else:
-                o = offsets.to(torch.int64)
-                counts = torch.diff(o, prepend=o.new_zeros(1)).tolist()
-        return self._forward_eager(x, counts)
+        return self._forward_eager(x, counts=counts, offsets=offsets)
 
     def _forward_grouped(self, x, offs):
         w1, w3, w2 = self.w1, self.w3, self.w2
@@ -134,9 +130,18 @@ class Experts(nn.Module):
         return torch._grouped_mm(h, w2, offs=offs)
 
     @torch._dynamo.disable
-    def _forward_eager(self, x, counts: List[int]):
+    def _forward_eager(self, x, counts=None, offsets=None):
         """Per-expert loop. Deliberately outside the compiled graph: the control flow depends on
-        token *data*, which no compiler can fuse -- everything around it stays compiled."""
+        token *data*, which no compiler can fuse -- everything around it stays compiled.
+        Every host conversion (offsets -> counts -> ints) happens here, behind the disable."""
+        if counts is None:
+            if offsets is None:
+                counts = [x.size(0)]
+            else:
+                o = offsets.to(torch.int64)
+                counts = torch.diff(o, prepend=o.new_zeros(1)).tolist()
+        elif torch.is_tensor(counts):
+            counts = counts.tolist()
         sizes = [int(c) for c in counts]
         if not any(sizes):
             return x.new_zeros((0,) + tuple(x.shape[1:]))
@@ -215,7 +220,7 @@ class MoE(nn.Module):
             if self.experts.grouped and xs.is_cuda and xs.dtype == torch.bfloat16:
                 ys = self.experts(xs, offsets=counts.cumsum(0).to(torch.int32))
             else:
-                ys = self.experts(xs, counts=counts.tolist())
+                ys = self.experts(xs, counts=counts)       # tensor; .tolist() happens disabled
         else:
             ys = self._ep_dispatch(xs, counts)
 
