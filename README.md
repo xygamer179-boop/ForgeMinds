@@ -226,6 +226,9 @@ exact selection: strided-sample threshold, canonical value-desc/index-asc order,
 indices win ties) and `softmax` (one kernel: max-sub, exp, sum, divide). Every one is a drop-in for the eager expression,
 degrades to torch on CPU/MPS, and is verified against the torch reference by running the *actual
 kernels* through `TRITON_INTERPRET=1` on CPU (`tests/test_kernels.py`, 66 numeric checks).
+Launch configs (`num_warps` x `num_stages`) are autotuned per shape on first GPU use — a
+grid that is a superset of the old fixed heuristic, so tuning can only help; CPU,
+interpreter and TileLens paths are unaffected.
 
 ```python
 import forgemind as fm

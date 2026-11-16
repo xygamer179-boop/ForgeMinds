@@ -40,7 +40,7 @@ import torch
 
 from . import _fallback as fb
 from . import _ops
-from ._common import (fast_ok, next_pow2, num_warps_for, tl, triton, triton_available)
+from ._common import (fast_ok, next_pow2, tl, triton, triton_available, tune)
 
 if triton_available():
 
@@ -142,6 +142,14 @@ def _flat_ok(gate, up):
             and gate.numel() > 0 and gate.numel() < 2 ** 31 and fast_ok(gate, up))
 
 
+if triton_available():
+    # Launch metadata (num_warps/num_stages) is chosen on first GPU use.
+    _swiglu_fwd_kernel = tune(_swiglu_fwd_kernel, key=[])
+    _swiglu_bwd_kernel = tune(_swiglu_bwd_kernel, key=[])
+    _swiglu_split_fwd = tune(_swiglu_split_fwd, key=["h"])
+    _swiglu_split_bwd = tune(_swiglu_split_bwd, key=["h"])
+
+
 # --------------------------------------------------------------------------- launches
 def _launch_swiglu(gate, up):
     gate = gate.contiguous()
@@ -149,8 +157,7 @@ def _launch_swiglu(gate, up):
     out = torch.empty_like(gate)
     n = gate.numel()
     block = _SWIGLU_BLOCK
-    _swiglu_fwd_kernel[(triton.cdiv(n, block),)](gate, up, out, n, block, n % block == 0,
-                                                 num_warps=num_warps_for(block))
+    _swiglu_fwd_kernel[(triton.cdiv(n, block),)](gate, up, out, n, block, n % block == 0)
     return out
 
 
@@ -162,8 +169,7 @@ def _launch_swiglu_bwd(gate, up, dy):
     block = _SWIGLU_BLOCK
     dg = torch.empty_like(gate)
     du = torch.empty_like(up)
-    _swiglu_bwd_kernel[(triton.cdiv(n, block),)](dy, gate, up, dg, du, n, block, n % block == 0,
-                                                 num_warps=num_warps_for(block))
+    _swiglu_bwd_kernel[(triton.cdiv(n, block),)](dy, gate, up, dg, du, n, block, n % block == 0)
     return dg, du
 
 
@@ -180,8 +186,7 @@ def _launch_swiglu_split(x):
     out = torch.empty((n, h), device=x2.device, dtype=x2.dtype)
     hp = next_pow2(h)
     rows = _split_rows(hp)
-    _swiglu_split_fwd[(triton.cdiv(n, rows),)](x2, out, n, h, hp, rows, h == hp, n % rows == 0,
-                                               num_warps=num_warps_for(rows * hp))
+    _swiglu_split_fwd[(triton.cdiv(n, rows),)](x2, out, n, h, hp, rows, h == hp, n % rows == 0)
     return out.view(lead + (h,))
 
 
@@ -193,7 +198,7 @@ def _launch_swiglu_split_bwd(x, dy):
     hp = next_pow2(h)
     rows = _split_rows(hp)
     _swiglu_split_bwd[(triton.cdiv(n, rows),)](x2, dy2, dx, n, h, hp, rows, h == hp,
-                                               n % rows == 0, num_warps=num_warps_for(rows * hp))
+                                               n % rows == 0)
     return dx.view(lead + (2 * h,))
 
 

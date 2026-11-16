@@ -641,7 +641,10 @@ indices (which `torch.topk` does not promise), NaN treated as largest, scatter b
 `softmax` fuses max-sub + exp + sum + divide with the closed-form backward. Both fall back
 to torch while `torch.compile` traces (one aten node, `fullgraph=True` holds), on CPU/MPS,
 for unsupported dtypes, and — for `topk` — for `k > 512`; every fallback is counted in
-`fm.kernels.stats()`.
+`fm.kernels.stats()`. The norm and SwiGLU kernels autotune their launch configs
+(`num_warps` x `num_stages`) on first GPU use; the grid is a superset of the old fixed
+heuristic, so tuning can only match or beat it, and the CPU interpreter, TileLens and
+triton-less installs never see the wrapper — `tune()` in `forgemind/kernels/_common.py`.
 
 ### 5.11 Checkpoint and resume
 
