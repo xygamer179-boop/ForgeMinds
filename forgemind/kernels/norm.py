@@ -38,7 +38,7 @@ import torch
 from . import _fallback as fb
 from . import _ops
 from ._common import (MAX_DIM, block_m_for, fast_ok, next_pow2, nprog_for,
-                      num_warps_for, tl, triton, triton_available)
+                      tl, triton, triton_available, tune)
 
 if triton_available():
 
@@ -206,6 +206,14 @@ if triton_available():
         tl.store(DWP + pid * d + cols, dw, mask=None if EVEN_COL else cm)
 
 
+if triton_available():
+    # Launch metadata (num_warps/num_stages) is chosen per shape on first GPU use.
+    _rmsnorm_fwd = tune(_rmsnorm_fwd, key=["d"])
+    _rmsnorm_bwd = tune(_rmsnorm_bwd, key=["d"])
+    _addrms_fwd = tune(_addrms_fwd, key=["d"])
+    _addrms_bwd = tune(_addrms_bwd, key=["d"])
+
+
 def _launch_rms_fwd(x, w, eps):
     """Launch the forward kernel; returns ``(y, rstd)`` (``rstd`` is fp32, ``[N]``)."""
     d = x.shape[-1]
@@ -216,8 +224,7 @@ def _launch_rms_fwd(x, w, eps):
     rows = block_m_for(block_d)
     rstd = torch.empty(n, device=x.device, dtype=torch.float32)
     _rmsnorm_fwd[(triton.cdiv(n, rows),)](
-        x2, w, y, rstd, n, eps, d, rows, block_d, d == block_d, n % rows == 0, True,
-        num_warps=num_warps_for(block_d * rows))
+        x2, w, y, rstd, n, eps, d, rows, block_d, d == block_d, n % rows == 0, True)
     return y.view(x.shape), rstd
 
 
@@ -231,8 +238,7 @@ def _launch_rms_bwd(x, w, rstd, dy):
     npg = nprog_for(n)
     dwp = torch.empty(npg, d, device=x2.device, dtype=torch.float32)
     block_d = next_pow2(d)
-    _rmsnorm_bwd[(npg,)](x2, w, dy2, rstd, dx, dwp, n, d, npg, block_d, d == block_d,
-                         num_warps=num_warps_for(block_d))
+    _rmsnorm_bwd[(npg,)](x2, w, dy2, rstd, dx, dwp, n, d, npg, block_d, d == block_d)
     return dx.view(x.shape), dwp.sum(0, dtype=torch.float32).to(w.dtype)
 
 
@@ -248,8 +254,7 @@ def _launch_addrms_fwd(x, delta, w, eps):
     rows = block_m_for(block_d)
     rstd = torch.empty(n, device=x.device, dtype=torch.float32)
     _addrms_fwd[(triton.cdiv(n, rows),)](
-        x2, d2, w, xn, y, rstd, n, eps, d, rows, block_d, d == block_d, n % rows == 0,
-        num_warps=num_warps_for(block_d * rows))
+        x2, d2, w, xn, y, rstd, n, eps, d, rows, block_d, d == block_d, n % rows == 0)
     return xn.view(x.shape), y.view(x.shape), rstd
 
 
@@ -265,8 +270,7 @@ def _launch_addrms_bwd(xn, w, rstd, gxn, gy):
     npg = nprog_for(n)
     dwp = torch.empty(npg, d, device=xn2.device, dtype=torch.float32)
     block_d = next_pow2(d)
-    _addrms_bwd[(npg,)](xn2, w, gy2, gxn2, rstd, dx, dd, dwp, n, d, npg, block_d, d == block_d,
-                        num_warps=num_warps_for(block_d))
+    _addrms_bwd[(npg,)](xn2, w, gy2, gxn2, rstd, dx, dd, dwp, n, d, npg, block_d, d == block_d)
     return (dx.view(xn.shape), dd.view(xn.shape),
             dwp.sum(0, dtype=torch.float32).to(w.dtype))
 

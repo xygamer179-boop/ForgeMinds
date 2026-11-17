@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import functools
 import os
+import sys
 
 import torch
 
@@ -152,6 +153,29 @@ def num_warps_for(block_elems: int, min_warps: int = 1, max_warps: int = 16) -> 
     while warps < min_warps:
         warps *= 2
     return warps
+
+
+def tune(fn, key):
+    """Wrap a kernel in :func:`triton.autotune` for real GPU runs; return it
+    unchanged for the CPU interpreter, TileLens, triton-less installs and boxes
+    without CUDA, where launch metadata has no effect on results.
+
+    The config grid sweeps ``num_warps`` over every value ``num_warps_for`` can
+    emit (powers of two up to its cap of 16) and ``num_stages`` over 1..4 -- the
+    pipeline depth these elementwise kernels never set, and the main lever left
+    for memory-bound code. Because the grid is a superset of the old fixed
+    launch, tuning can only match or beat the heuristic, never regress it.
+    Once applied, the autotuner owns ``num_warps``/``num_stages``: launchers
+    must not pass them (triton rejects the conflict). Keys cover the shape
+    constexprs that change tile geometry; row counts and tensor dtypes are
+    folded in by triton itself.
+    """
+    if (not triton_available() or not torch.cuda.is_available()
+            or os.environ.get("TRITON_INTERPRET") == "1" or "tilelens" in sys.modules):
+        return fn
+    configs = [triton.Config({}, num_warps=w, num_stages=s)
+               for w in (1, 2, 4, 8, 16) for s in (1, 2, 3, 4)]
+    return triton.autotune(configs=configs, key=list(key))(fn)
 
 
 def block_m_for(block_d: int, target: int = 4096) -> int:

@@ -767,3 +767,49 @@ the dtype. Reductions *do* now consistently pass `axis=0`, matching `kl.py`/`nor
 
 `inductor=nan` env-wide (missing `Python.h`, §6). Speed gates stay GPU-only:
 `kbench --ops topk,softmax --check` on hardware decides wins; nothing here is claimed.
+
+---
+
+## 13. Round eight (2026-11-14): the first GPU numbers — and where they went
+
+`python -m forgemind.cli kbench --ops rms_norm,add_rms_norm,swiglu,swiglu_split,qk_norm_rope`
+on the user's GPU (hardware model not yet recorded — the round-trip asked for
+`nvidia-smi`; ms/call, `both` = forward+backward, warmup 5):
+
+| op | shape | eager | inductor | ours | vs best |
+|---|---|---|---|---|---|
+| rms_norm | [8192,4096] | 3.948 | 0.276 | 0.591 | 0.47x |
+| add_rms_norm | x,delta [8192,4096] | 4.611 | 0.436 | 1.239 | 0.35x |
+| swiglu | gate,up [8192,11008] | 7.529 | 1.314 | 2.466 | 0.53x |
+| swiglu_split | [8192,22016] | 9.431 | 1.563 | 2.436 | 0.64x |
+| qk_norm_rope | [8,2048,32,128] | 13.538 | nan (compile failed) | 1.394 | 9.71x |
+
+Four kernels lose to inductor; `qk_norm_rope` wins outright because inductor could
+not compile it. The gap has one obvious cause: every losing kernel was launched
+with **fixed** metadata — warps from an element-count heuristic (`num_warps_for`,
+capped at 16), pipeline stages left at triton's default of 3, and no tuning of any
+kind. Inductor (and Liger, which these kernels follow) autotunes launch configs
+per shape; on memory-bound norm/pointwise code that is most of the difference.
+
+**The change.** `_common.tune` wraps the eight norm/SwiGLU kernels in
+`triton.autotune` on real GPU runs: `num_warps` in {1,2,4,8,16} x `num_stages` in
+{1,2,3,4} (20 configs; OOM configs are rejected by triton's own benchmark and
+skipped), keys `["d"]` for the norm kernels, `[]` for flat SwiGLU, `["h"]` for
+split SwiGLU — row counts and tensor dtypes are folded into the key by triton
+itself. The grid is a **superset of the fixed launch it replaces** (every value
+`num_warps_for` can emit, plus the default stage count), so a tuned kernel can
+only match or beat the heuristic it succeeded. The wrapper is inert wherever
+launch metadata has no effect: no CUDA, the CPU interpreter (`TRITON_INTERPRET=1`),
+TileLens (`tilelens` imported), triton-less installs — those paths are unchanged,
+which is why `kernel_interp_check` stays 66/66 and the TileLens probe stays green
+even though the launchers no longer pass `num_warps` (the interpreter never used
+it: warp counts already varied by shape across the suite). Once applied, the
+autotuner owns `num_warps`/`num_stages`; triton rejects a launcher that also
+passes them.
+
+First call of each shape key benches the ~20 configs (about a second), absorbed by
+kbench's warmup and by the first training step. **The after-numbers are pending a
+re-run on the same GPU**: this entry records the before (user-measured) and the
+mechanism, and makes no claim about the result. Re-measure with:
+
+`python -m forgemind.cli kbench --ops rms_norm,add_rms_norm,swiglu,swiglu_split,qk_norm_rope --check`
