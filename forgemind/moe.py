@@ -29,6 +29,25 @@ __all__ = ["MoE", "Router", "Experts"]
 
 _HAS_GROUPED_MM = hasattr(torch, "_grouped_mm")
 
+_DYNAMO_PREPARED = False
+
+
+def _prepare_dynamo() -> None:
+    """Apply ``torch._dynamo.disable`` to the eager-dispatch methods, once, lazily.
+
+    Decorating in the class body imports ``torch._dynamo`` at module load, and that pulls
+    ``triton`` into every plain ``import forgemind`` (audit BS-004). The disable flag only
+    matters inside ``torch.compile``, which cannot run before these classes were
+    constructed -- so deferring to ``__init__`` changes nothing observable.
+    """
+    global _DYNAMO_PREPARED
+    if _DYNAMO_PREPARED:
+        return
+    _DYNAMO_PREPARED = True
+    import torch._dynamo
+    Experts._forward_eager = torch._dynamo.disable(Experts._forward_eager)
+    MoE._ep_dispatch = torch._dynamo.disable(MoE._ep_dispatch)
+
 
 def _counts_of(idx_flat: torch.Tensor, n: int) -> torch.Tensor:
     """Per-expert token counts with a *static* output shape.
@@ -82,6 +101,7 @@ class Experts(nn.Module):
 
     def __init__(self, n_local, dim, hidden, offload=False, grouped_mm=False):
         super().__init__()
+        _prepare_dynamo()
         self.n_local, self.offload = n_local, offload
         # capability check happens once, here -- not per forward (no try/except in the hot path)
         self.grouped = bool(grouped_mm) and _HAS_GROUPED_MM and not offload
@@ -129,7 +149,6 @@ class Experts(nn.Module):
         h = F.silu(h) * torch._grouped_mm(x, w3, offs=offs)
         return torch._grouped_mm(h, w2, offs=offs)
 
-    @torch._dynamo.disable
     def _forward_eager(self, x, counts=None, offsets=None):
         """Per-expert loop. Deliberately outside the compiled graph: the control flow depends on
         token *data*, which no compiler can fuse -- everything around it stays compiled.
@@ -163,6 +182,7 @@ class MoE(nn.Module):
     def __init__(self, dim, hidden, n_experts, top_k, n_shared=0, ep_size=1, ep_group=None, ep_rank=0,
                  offload_experts=False, grouped_mm=False, aux_coef=1e-2, z_coef=1e-3):
         super().__init__()
+        _prepare_dynamo()
         assert n_experts % ep_size == 0
         self.dim, self.n_experts, self.top_k = dim, n_experts, top_k
         self.ep_size, self.ep_group, self.ep_rank = ep_size, ep_group, ep_rank
@@ -230,7 +250,6 @@ class MoE(nn.Module):
             out = out + self.shared(x)
         return out.reshape(shp)
 
-    @torch._dynamo.disable
     def _ep_dispatch(self, xs, counts):
         """Expert-parallel dispatch. Split sizes must be host-side ints for `all_to_all_single`, so
         the whole exchange runs eagerly; there is exactly one host read for both directions."""

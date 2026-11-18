@@ -93,8 +93,14 @@ def sync_expert_grads(model, ctx: DistContext, params=None):
     if not grads:
         return
     if ctx.edp_group is not None and dist.get_world_size(ctx.edp_group) > 1:
-        for g in grads:
-            dist.all_reduce(g, group=ctx.edp_group)
+        # one fused collective instead of one round trip per parameter (audit PERF-005);
+        # all_reduce_coalesced accepts unequal shapes. Fall back to the loop where the
+        # backend/build does not provide it -- same semantics either way.
+        try:
+            dist.all_reduce_coalesced(grads, group=ctx.edp_group)
+        except (AttributeError, RuntimeError, TypeError):
+            for g in grads:
+                dist.all_reduce(g, group=ctx.edp_group)
     torch._foreach_div_(grads, ctx.dp_world)
 
 

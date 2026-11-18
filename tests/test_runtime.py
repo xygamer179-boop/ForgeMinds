@@ -97,3 +97,28 @@ def test_forgemind_exports_resolve():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_import_forgemind_does_not_load_kernels_or_triton():
+    """BS-004 (audit): `import forgemind` must not import the kernels package, triton or
+    torch._dynamo -- the lazy contract in fm.__getattr__'s docstring. Subprocess so the
+    test runner's own imports cannot contaminate the check."""
+    import json
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = (
+        "import json, sys, forgemind as fm\n"
+        "heavy = ['forgemind.kernels', 'triton', 'torch._dynamo']\n"
+        "after_import = [m for m in heavy if m in sys.modules]\n"
+        "_ = fm.kernels.rms_norm\n"
+        "after_touch = ('forgemind.kernels' in sys.modules and 'triton' in sys.modules)\n"
+        "print(json.dumps({'after_import': after_import, 'after_touch': after_touch}))\n"
+    )
+    env = dict(os.environ, PYTHONPATH=root)
+    out = subprocess.run([sys.executable, "-c", code], cwd=root, env=env,
+                         capture_output=True, text=True, timeout=180)
+    assert out.returncode == 0, out.stderr[-2000:]
+    payload = json.loads(out.stdout.strip().splitlines()[-1])
+    assert payload["after_import"] == [], f"import forgemind pulled heavy modules: {payload}"
+    assert payload["after_touch"] is True, "fm.kernels must still load on touch"

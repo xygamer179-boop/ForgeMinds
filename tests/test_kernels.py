@@ -290,3 +290,44 @@ def test_compile_fullgraph_with_fused_ops():
     for n, p in model.named_parameters():
         if p.grad is not None:
             assert torch.allclose(p.grad, eager_grads[n], atol=1e-6, rtol=1e-5), n
+
+
+def test_qk_norm_rope_noncontiguous_inputs_stay_correct():
+    """BUG-005 (audit): _ok must reject non-contiguous x/w -- the kernels index them at
+    unit stride, and under TRITON_INTERPRET a strided view used to be read as contiguous."""
+    x = torch.randn(2, 4, 2, 8)
+    w = torch.randn(8)
+    cos = torch.randn(4, 4)
+    sin = torch.randn(4, 4)
+    xn = x.transpose(0, 1)                      # [4, 2, 2, 8]: non-contiguous, T is now 2
+    assert not xn.is_contiguous()
+    cos2, sin2 = cos[:2], sin[:2]
+    # public-API comparison: the non-contiguous input must take the torch fallback while a
+    # contiguous twin takes the kernel (under TRITON_INTERPRET this is kernel-vs-fallback
+    # parity; before the fix the strided view was read as contiguous and diverged).
+    got = kernels.qk_norm_rope(xn, w, cos2, sin2)
+    ref = kernels.qk_norm_rope(xn.contiguous(), w, cos2, sin2)
+    assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5)
+    w_strided = torch.randn(16)[::2]            # non-contiguous weight
+    assert not w_strided.is_contiguous()
+    got2 = kernels.qk_norm_rope(x, w_strided, cos, sin)
+    ref2 = kernels.qk_norm_rope(x, w_strided.contiguous(), cos, sin)
+    assert torch.allclose(got2, ref2, atol=1e-5, rtol=1e-5)
+
+
+def test_rms_norm_nondefault_eps_backwards_match_torch():
+    """BUG-008 (audit): the backward must work for eps != 1e-6 (the caller's real eps is
+    now plumbed through) and dW must match torch's fp32 reference path."""
+    x = torch.randn(6, 32)
+    for eps in (1e-4, 3e-5):
+        wa, wb = torch.randn(32).requires_grad_(True), torch.randn(32).requires_grad_(True)
+        with torch.no_grad():                               # identical weights, isolated grads
+            wb.copy_(wa)
+        a, b = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
+        out_a = kernels.rms_norm(a, wa, eps)
+        out_b = F.rms_norm(b, (32,), wb, eps)
+        assert torch.allclose(out_a, out_b, atol=1e-5, rtol=1e-5), eps
+        out_a.sum().backward()
+        out_b.sum().backward()
+        assert torch.allclose(a.grad, b.grad, atol=1e-4, rtol=1e-4), eps
+        assert torch.allclose(wa.grad, wb.grad, atol=1e-4, rtol=1e-4), eps

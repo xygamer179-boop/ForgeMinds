@@ -257,6 +257,13 @@ class Forge:
     def _clip_coef(self):
         if self.clip <= 0:
             return None
+        # OffloadedAdamW keeps moved grads in its own buffers (p.grad is None), so plain
+        # clip_grad_norm_ over model.parameters() would silently miss them and apply the
+        # update unclipped (audit BUG-007). Prefer the optimizer's own clip, which flushes
+        # pending grads first -- the same duck-typed dispatch Trainer._clip uses.
+        own_clip = getattr(self.optimizer, "clip_grad_norm_", None)
+        if callable(own_clip):
+            return own_clip(self.clip)
         gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip)
         return gn
 
@@ -267,10 +274,18 @@ class Forge:
         """
         if batch is not None:
             batch = _to_device(batch, self.device)
-            with self._autocast():
-                out = self._call_with_batch(batch)
-                loss = self._extract_loss(out, batch)
-            self.backward(loss)
+            # DDP: the gradient all-reduce only has to run on the micro-batch that completes
+            # the accumulation window; Trainer does this with no_sync() and Forge did not
+            # (audit PERF-006). self.micro counts *completed* micro-batches.
+            last_micro = (self.micro + 1) >= self.accum
+            cm = (contextlib.nullcontext()
+                  if last_micro or not isinstance(self.model, nn.parallel.DistributedDataParallel)
+                  else self.model.no_sync())
+            with cm:
+                with self._autocast():
+                    out = self._call_with_batch(batch)
+                    loss = self._extract_loss(out, batch)
+                self.backward(loss)
         if self.micro < self.accum:
             return None
         return self._update()
@@ -299,12 +314,19 @@ class Forge:
             (loss_v,), gn_v = torch.stack([step_loss.float()]).tolist(), float("nan")
         self._acc_loss = None
         if self.skip_nonfinite or self.skip_spike_factor > 0:
-            finite = bool(math.isfinite(loss_v) and math.isfinite(gn_v))
+            # gn_v is nan when clipping is disabled (clip=0, the documented "no clipping"
+            # setting) -- a sentinel, not a non-finite gradient. Including it in the check
+            # skipped every step forever (audit BUG-001).
+            finite = bool(math.isfinite(loss_v) and (gn is None or math.isfinite(gn_v)))
             spike = (self.skip_spike_factor > 0 and self.ema_loss is not None
                      and loss_v > self.skip_spike_factor * self.ema_loss)
             skipped = (not finite) or spike
         if skipped:
             self._skipped += 1
+            if self.scaler is not None:
+                # unscale_() already ran for this step; update() re-arms it (and applies
+                # the inf check) so the next step's unscale_() doesn't raise (audit BUG-002).
+                self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
             self.micro = 0
             self._acc_loss = None
@@ -346,34 +368,41 @@ class Forge:
 
     def fit(self, loader, max_steps=None, epochs: int = 1):
         """Iterate ``loader`` until ``max_steps`` optimizer steps have been taken."""
-        loader = self._batches(loader)
         limit = max_steps or self.max_steps
         t0 = time.perf_counter()
         last = None
         stopped = False
         try:
             for epoch in range(epochs):
-                for batch in loader:
-                    last = self.step(batch)
-                    if self.step_count >= limit:
-                        stopped = True
-                        break
-                    if last is not None:
-                        last = dict(last, ms=1e3 * (time.perf_counter() - t0))
+                # Fresh wrapper per epoch: _AsyncLoader (async_batches=True, the default)
+                # is one-shot -- reusing it past epoch 0 iterated an exhausted loader and
+                # silently produced zero batches for epochs >= 1 (audit BUG-003).
+                epoch_loader = self._batches(loader)
+                try:
+                    for batch in epoch_loader:
+                        last = self.step(batch)
+                        if self.step_count >= limit:
+                            stopped = True
+                            break
+                        if last is not None:
+                            last = dict(last, ms=1e3 * (time.perf_counter() - t0))
+                finally:
+                    _shutdown(epoch_loader)
                 for cb in self.callbacks:
                     if hasattr(cb, "on_epoch"):
                         cb.on_epoch(self, epoch)
                 if stopped:
                     break
         finally:
-            _shutdown(loader)          # stop the prefetch thread, not just drop the reference
+            _shutdown(loader)          # no-op unless the raw loader itself is closable
         return self.history
 
     @torch.no_grad()
     def evaluate(self, loader, max_batches: int | None = None):
         loader = self._batches(loader)
         self.model.eval()
-        total, n = 0.0, 0
+        total = None                     # device-side accumulator: one host read for the
+        n = 0                            # whole eval, not a D2H stall per batch (PERF-006)
         try:
             for i, batch in enumerate(loader):
                 if max_batches is not None and i >= max_batches:
@@ -381,12 +410,13 @@ class Forge:
                 batch = _to_device(batch, self.device)
                 with self._autocast():
                     loss = self._extract_loss(self._call_with_batch(batch), batch)
-                total += float(loss.detach())
+                d = loss.detach()
+                total = d if total is None else total + d
                 n += 1
         finally:
             _shutdown(loader)
             self.model.train()
-        return total / max(1, n)
+        return 0.0 if total is None else float(total / n)
 
     # ------------------------------------------------------------------ state
     def save(self, path: str):

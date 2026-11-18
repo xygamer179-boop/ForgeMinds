@@ -155,13 +155,18 @@ class Muon(torch.optim.Optimizer):
         ``torch.float32`` for maximum accuracy -- the kernels accept either)
     betas, eps : AdamW parameters for the vector groups
     adam_lr : learning rate for the auto-created AdamW groups (default: ``lr``)
+    group : ``torch.distributed`` process group for the multi-GPU Newton-Schulz combine
+        (default ``None`` = the world group). The buckets must be identical on every rank
+        of that group -- true for plain DDP replication, **not** for TP/PP/EP shards, where
+        you must pass your data-parallel (replication) group instead (audit BUG-006).
     """
 
     def __init__(self, params, lr: float = 0.02, weight_decay: float = 0.0,
                  momentum: float = 0.95, nesterov: bool = True, ns_steps: int = 5,
                  ns_dtype: torch.dtype | None = torch.bfloat16,
                  betas: tuple[float, float] = (0.9, 0.95), eps: float = 1e-10,
-                 adam_lr: float | None = None):
+                 adam_lr: float | None = None,
+                 group: "dist.ProcessGroup | None" = None):
         if ns_steps < 1:
             raise ValueError(f"ns_steps must be >= 1, got {ns_steps}")
         groups = _as_groups(params, lr if adam_lr is None else adam_lr)
@@ -169,6 +174,7 @@ class Muon(torch.optim.Optimizer):
                         nesterov=nesterov, ns_steps=ns_steps, ns_dtype=ns_dtype,
                         betas=betas, eps=eps)
         super().__init__(groups, defaults)
+        self._dist_group = group
 
     def add_param_group(self, param_group: dict) -> None:
         """Add a group with the same auto-split/validation as the constructor."""
@@ -182,17 +188,20 @@ class Muon(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
-        rank = dist.get_rank() if distributed else 0
-        world = dist.get_world_size() if distributed else 1
+        initialized = dist.is_available() and dist.is_initialized()
+        pg = getattr(self, "_dist_group", None)
+        world = dist.get_world_size(pg) if initialized else 1
+        rank = dist.get_rank(pg) if initialized else 0
+        distributed = initialized and world > 1
         for group in self.param_groups:
             if group["use_muon"]:
-                self._muon_group(group, rank, world, distributed)
+                self._muon_group(group, rank, world, distributed, pg)
             else:
                 self._adam_group(group)
         return loss
 
-    def _muon_group(self, group: dict, rank: int, world: int, distributed: bool) -> None:
+    def _muon_group(self, group: dict, rank: int, world: int, distributed: bool,
+                    pg: "dist.ProcessGroup | None" = None) -> None:
         lr = group["lr"]
         wd = group["weight_decay"]
         beta = group["momentum"]
@@ -235,7 +244,7 @@ class Muon(torch.optim.Optimizer):
                 own = list(range(rank, G.shape[0], world))
                 if own:
                     out[own] = newton_schulz(G[own], steps=group["ns_steps"], dtype=ns_dtype)
-                dist.all_reduce(out)
+                dist.all_reduce(out, group=pg)   # pg=WORLD is only valid for replicated buckets
             else:
                 out = newton_schulz(G, steps=group["ns_steps"], dtype=ns_dtype)
 

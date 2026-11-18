@@ -30,7 +30,7 @@ with a test behind it rather than a hope.
 from . import _common
 from ._common import HAS_TRITON, get_backend, reset_stats, set_backend, stats
 from ._ops import use_custom_ops   # public: force the torch.library path
-from .apply import enable, patch
+from .apply import enable, patch, revert
 from .kl import distill_kl, kl_distill_loss, kl_div, kl_div_logits
 from .norm import add_rms_norm, rms_norm
 from .ns import newton_schulz
@@ -44,7 +44,7 @@ __all__ = [
     "rms_norm", "add_rms_norm", "qk_norm_rope", "swiglu", "swiglu_split",
     "kl_div_logits", "kl_div", "kl_distill_loss", "distill_kl",
     "newton_schulz", "topk", "softmax",
-    "enable", "patch", "available", "use_custom_ops",
+    "enable", "patch", "revert", "available", "use_custom_ops",
 ]
 
 

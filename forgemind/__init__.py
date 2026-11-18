@@ -18,9 +18,10 @@ def __getattr__(name):
 
     ``fm.nn`` (the composable ``RMSNorm`` / ``SwiGLU`` blocks) is lazy for the same reason: it
     pulls in the kernels package, and ``import forgemind`` should stay cheap for people who only
-    want the trainer.
+    want the trainer. (``forge``/``trainer`` are eager -- ``fm.Forge`` is core -- so they are
+    not listed here.)
     """
-    if name in ("kernels", "forge", "autotune", "nn", "muon"):
+    if name in ("kernels", "autotune", "nn", "muon"):
         import importlib
         return importlib.import_module(f".{name}", __name__)
     if name == "Muon":

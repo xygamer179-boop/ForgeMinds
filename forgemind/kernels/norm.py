@@ -216,8 +216,9 @@ if triton_available():
             if GEMMA:
                 dW_acc += dY_row * normed
             else:
-                # The forward multiplies W by normed rounded to W's dtype.
-                dW_acc += dY_row * normed.to(W.dtype.element_ty).to(tl.float32)
+                # the forward weight-multiply is fp32 with a single rounding to Y's dtype;
+                # dW must integrate the same fp32 `normed` (no W.dtype round in between).
+                dW_acc += dY_row * normed
 
         if GEMMA:
             dY_W = dY_row * (W_row + 1.0)
@@ -490,10 +491,8 @@ if triton_available():
         # match one-row arithmetic because its fused multiply-add turns -0 into +0 on sm75.
         output = (inv_var / n_cols)[:, None] * (n_cols * dY_W - normed * rowsum_dY_normed[:, None])
         tl.store(dX + rows[:, None] * dX_row_stride + col_offsets[None, :], output, mask = mask)
-        # masked rows contribute zero; this dW path is dead unless TRAIN_W.
-        if not GEMMA:
-            # forward multiplies W by normed rounded to W's dtype.
-            normed = normed.to(W.dtype.element_ty).to(tl.float32)
+        # masked rows contribute zero; this dW path is dead unless TRAIN_W. `normed` stays
+        # fp32, matching the forward's fp32 weight multiply.
         return tl.sum(dY_rows * normed, axis = 0)
 
 
@@ -1102,16 +1101,17 @@ def _launch_rms_fwd(x, w, eps):
     return y2.view(x.shape), rstd
 
 
-def _launch_rms_bwd(x, w, rstd, dy):
+def _launch_rms_bwd(x, w, rstd, dy, eps=1e-6):
     """Launch the ported RMSNorm backward; returns ``(dx, dw)``."""
     d = x.shape[-1]
     x2 = x.contiguous().view(-1, d)
     dy2 = dy.contiguous().view(-1, d)
     w = w.contiguous()          # multi-row kernels index W at unit stride
     dx2 = torch.empty_like(x2)
-    # eps is unused by the backward kernels (rstd carries it); the value only seeds the
-    # multi-row self-check key, which compares the two paths against each other.
-    dw = _rms_backward(dy2, dx2, x2, w, rstd, 1e-6, False, _eager_kernel, train_w=True)
+    # eps is unused by the backward math (rstd carries it); it only seeds the multi-row
+    # self-check key, so passing the caller's real eps avoids a duplicate GPU self-check
+    # (and cache key) when eps != 1e-6.
+    dw = _rms_backward(dy2, dx2, x2, w, rstd, eps, False, _eager_kernel, train_w=True)
     return dx2.view(x.shape), dw
 
 
@@ -1153,13 +1153,14 @@ class _RMSNormFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w, eps):
         y, rstd = _launch_rms_fwd(x, w, eps)
+        ctx.eps = float(eps)    # feeds the backward's self-check key (BUG-008)
         ctx.save_for_backward(x, w, rstd)
         return y
 
     @staticmethod
     def backward(ctx, dy):
         x, w, rstd = ctx.saved_tensors
-        dx, dw = _launch_rms_bwd(x, w, rstd, dy)
+        dx, dw = _launch_rms_bwd(x, w, rstd, dy, getattr(ctx, "eps", 1e-6))
         return dx, dw, None
 
 

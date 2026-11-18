@@ -95,3 +95,18 @@ if __name__ == "__main__":
             print("==", k)
             f()
     print("ALL SYNC AUDIT TESTS PASSED")
+
+
+def test_explicit_cuda_syncs_join_the_patch_set():
+    """BS-006 (audit): torch.cuda.synchronize / Stream.synchronize / Event.synchronize
+    must be counted too -- offload's own flush uses them -- and unpatched on exit."""
+    import torch
+
+    with count_host_syncs(capture_stack=False) as c:
+        assert getattr(torch.cuda.synchronize, "_fm_sync", False) is True
+        assert getattr(torch.cuda.Stream.synchronize, "_fm_sync", False) is True
+        assert getattr(torch.cuda.Event.synchronize, "_fm_sync", False) is True
+        assert c is not None
+    assert not getattr(torch.cuda.synchronize, "_fm_sync", False)
+    assert not getattr(torch.cuda.Stream.synchronize, "_fm_sync", False)
+    assert not getattr(torch.cuda.Event.synchronize, "_fm_sync", False)
