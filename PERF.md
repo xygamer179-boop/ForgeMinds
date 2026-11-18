@@ -813,3 +813,63 @@ re-run on the same GPU**: this entry records the before (user-measured) and the
 mechanism, and makes no claim about the result. Re-measure with:
 
 `python -m forgemind.cli kbench --ops rms_norm,add_rms_norm,swiglu,swiglu_split,qk_norm_rope --check`
+
+---
+
+## 14. Round nine (2026-11-17): RMSNorm kernels ported from Unsloth (user-directed)
+
+The user asked to import Unsloth's kernel scripts wholesale. Two hard blockers
+made a literal import impossible, so the direction was confirmed and executed as
+a scoped port instead:
+
+- **License split.** Unsloth's root license is Apache-2.0, but 12 of the 23 files
+  under `unsloth/kernels/` carry `SPDX-License-Identifier: AGPL-3.0-only` —
+  including `qk_norm_rope.py`, `fused_add_rms_layernorm.py` and `triton_launch.py`
+  (which `rms_layernorm.py` imports). This repo has no LICENSE file at all, so
+  AGPL code was not brought in.
+- **API mismatch.** Their `swiglu.py` is an HF-transformers patching pattern (3D
+  shapes, in-place fused backward tied to `LlamaMLP`); their
+  `fused_add_rms_layernorm.py` is decode-inference only ("No autograd", bails
+  under `torch.compiler.is_compiling()`). Neither can replace training kernels.
+  Their `utils.py` pulls in `fp8`, `nvfp4`, `bitsandbytes` availability and an
+  external `unsloth_zoo` package; their `__init__.py` monkeypatches the host.
+
+**What was ported** (the user's chosen option: Apache-licensed training kernels
+behind our API): Unsloth's `rms_layernorm.py` training set into
+`forgemind/kernels/norm.py` — one-row forward/backward, the narrow-width
+multi-row path with its CUDA bit-parity self-check, SM-capped weight-gradient
+partials reduced in a fixed Triton tile order, the per-architecture `num_warps`
+tables, and int64 index guards. Public API, `autograd.Function`, the
+`torch.library.custom_op` compile layer, the `_ok` gate and `add_rms_norm`
+(our own fused kernel — no Apache training equivalent exists) are unchanged.
+`swiglu`, `qk_norm_rope` (already 9.71x in round eight) and the rest were not
+touched.
+
+**Documented adaptations** (file header carries the full Apache attribution):
+
+- the eager-launch fast path through unsloth's `triton_launch.py` (AGPL) was
+  replaced with Triton's standard launch; Gemma dispatch,
+  `torch.library.triton_op`/compile-cache, HF module patching and the
+  save-output/reuse-grad options were dropped (our custom_op layer owns that);
+- `calculate_settings`, `norm_num_warps`, `torch_gpu_device` and the int64-index
+  predicate were reimplemented from their published behaviour;
+- the multi-row path is gated to CUDA (it replays GPU reduction order);
+- interpreter compatibility: the dW row loop and the partials-reduction loop use
+  `while` instead of `range`/`tl.range` (triton 3.6's CPU interpreter cannot
+  call `__index__` on a tl-scalar bound), and the forward's weight multiply runs
+  in fp32 with a single rounding (numpy's bf16 multiply is broken in the
+  interpreter; fp32-with-one-rounding also matches torch's opmath path).
+
+**Launch config:** the ported kernels use Unsloth's measured settings
+(`calculate_settings` + architecture tables, `UNSLOTH_NORM_ARCH_WARPS=0` to
+disable) rather than round eight's autotune — their tables are their measured
+answer, and the two mechanisms must not fight over `num_warps`. Autotune stays
+on `add_rms_norm` and SwiGLU.
+
+**Gates** (torch 2.11.0+cu130, triton 3.6.0): CPU suite **218/19**, full
+INTERPRET suite **236/1**, `kernel_interp_check` **66/66** (fp32 vs torch,
+forward and backward), TileLens probe **exit 0**, `test_docs` **6/6**,
+pyflakes clean. **No GPU in this sandbox: the kbench re-measure on user hardware
+decides the round** — same command as round eight:
+
+`python -m forgemind.cli kbench --ops rms_norm,add_rms_norm,swiglu,swiglu_split,qk_norm_rope --check`

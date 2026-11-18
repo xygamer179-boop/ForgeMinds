@@ -645,6 +645,9 @@ for unsupported dtypes, and — for `topk` — for `k > 512`; every fallback is 
 (`num_warps` x `num_stages`) on first GPU use; the grid is a superset of the old fixed
 heuristic, so tuning can only match or beat it, and the CPU interpreter, TileLens and
 triton-less installs never see the wrapper — `tune()` in `forgemind/kernels/_common.py`.
+The RMSNorm kernels are ported from Unsloth's `rms_layernorm.py` (Apache-2.0;
+attribution and the exact adaptations are in the `forgemind/kernels/norm.py` header);
+the fused add-RMSNorm, SwiGLU and the remaining kernels are this repo's own.
 
 ### 5.11 Checkpoint and resume
 
