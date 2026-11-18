@@ -228,7 +228,9 @@ degrades to torch on CPU/MPS, and is verified against the torch reference by run
 kernels* through `TRITON_INTERPRET=1` on CPU (`tests/test_kernels.py`, 66 numeric checks).
 Launch configs (`num_warps` x `num_stages`) are autotuned per shape on first GPU use — a
 grid that is a superset of the old fixed heuristic, so tuning can only help; CPU,
-interpreter and TileLens paths are unaffected.
+interpreter and TileLens paths are unaffected. The RMSNorm pair itself is ported from
+Unsloth's `rms_layernorm.py` (Apache-2.0, attribution and the list of adaptations in
+the file header).
 
 ```python
 import forgemind as fm
