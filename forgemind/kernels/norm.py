@@ -1097,6 +1097,7 @@ def _launch_rms_fwd(x, w, eps):
     """Launch the ported RMSNorm forward; returns ``(y, rstd)`` (``rstd`` is fp32 inv-std, ``[N]``)."""
     d = x.shape[-1]
     x2 = x.contiguous().view(-1, d)
+    w = w.contiguous()          # multi-row kernels index W at unit stride
     y2, rstd = _rms_forward(x2, w, eps, False, _eager_kernel)
     return y2.view(x.shape), rstd
 
@@ -1106,6 +1107,7 @@ def _launch_rms_bwd(x, w, rstd, dy):
     d = x.shape[-1]
     x2 = x.contiguous().view(-1, d)
     dy2 = dy.contiguous().view(-1, d)
+    w = w.contiguous()          # multi-row kernels index W at unit stride
     dx2 = torch.empty_like(x2)
     # eps is unused by the backward kernels (rstd carries it); the value only seeds the
     # multi-row self-check key, which compares the two paths against each other.
