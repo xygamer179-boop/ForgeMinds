@@ -121,6 +121,9 @@ if triton_available():
 
 def _launch_qk_norm_rope(x, w, cos, sin, eps):
     """Per-head RMSNorm + RoPE; returns ``(out, rstd)`` with ``rstd`` of shape ``[B, T, H]``."""
+    # the custom-op path (torch.compile/export) can bypass the public _ok() gate; the
+    # kernel indexes x/w at unit stride, so materialize contiguous copies when needed.
+    x, w = x.contiguous(), w.contiguous()
     b, t_len, h, d = x.shape
     hd = d // 2
     out = torch.empty_like(x)
@@ -137,7 +140,7 @@ def _launch_qk_norm_rope_bwd(x, w, cos, sin, rstd, g):
     """Returns ``(dx, dw)``."""
     b, t_len, h, d = x.shape
     hd = d // 2
-    g = g.contiguous()
+    x, w, g = x.contiguous(), w.contiguous(), g.contiguous()   # unit-stride indexing (BUG-005)
     dx = torch.empty_like(x)
     n = b * t_len
     npg = nprog_for(n)
@@ -213,6 +216,10 @@ def _ok(x, w, cos, sin):
     if cos.shape[-1] != x.shape[-1] // 2 or sin.shape != cos.shape:
         return False
     if cos.shape[0] not in (1, x.shape[1]) and cos.numel() // cos.shape[-1] < x.shape[1]:
+        return False
+    # the kernels index x and w at unit stride; a strided view must take the torch
+    # fallback instead of being read as contiguous (audit BUG-005).
+    if not (x.is_contiguous() and w.is_contiguous()):
         return False
     return cos.is_contiguous() and sin.is_contiguous() and fast_ok(x, w, cos, sin)
 

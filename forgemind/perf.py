@@ -35,6 +35,10 @@ _LOCK = threading.RLock()
 
 _SYNC_METHODS = ("item", "tolist", "numpy", "__float__", "__int__", "__bool__", "cpu")
 _ORIGINALS: dict = {}
+# Explicit host waits that are not tensor methods: torch.cuda.synchronize(),
+# Stream.synchronize() and Event.synchronize() -- offload's own D2H flush uses the latter
+# two, and counting only tensor reads made those stalls invisible (audit BS-006).
+_CUDA_ORIGINALS: list = []
 
 
 class HostSyncCounter:
@@ -88,8 +92,47 @@ def _patch() -> None:
                 return wrapper
 
             setattr(torch.Tensor, name, make())
+        _patch_cuda_syncs()
         _TOTAL["force"] = False
         _PATCHED = True
+
+
+def _patch_cuda_syncs() -> None:
+    """Count ``torch.cuda.synchronize`` / ``Stream.synchronize`` / ``Event.synchronize``.
+
+    Distributed collectives are deliberately *not* counted: they are device-side network
+    ops, not host<->device reads, which is the documented scope of this counter.
+    """
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None:
+        return
+    targets = [(cuda, "synchronize", "always")]
+    for cls_name in ("Stream", "Event"):
+        cls = getattr(cuda, cls_name, None)
+        if cls is not None and getattr(cls, "synchronize", None) is not None:
+            targets.append((cls, "synchronize", "always" if cls_name == "Event" else "stream"))
+    for owner, name, kind in targets:
+        orig = getattr(owner, name, None)
+        if orig is None or getattr(orig, "_fm_sync", False):
+            continue
+        label = f"{getattr(owner, '__name__', 'cuda')}.{name}"
+
+        def make(orig=orig, kind=kind, label=label):
+            def wrapper(*args, **kwargs):
+                count = True
+                if kind == "stream" and args:
+                    dev = getattr(args[0], "device", None)
+                    count = dev is None or getattr(dev, "type", None) == "cuda"
+                if (count and torch.cuda.is_available()) or _TOTAL.get("force", False):
+                    _TOTAL["n"] += 1
+                    for c in list(_COUNTERS):
+                        c._hit(label)
+                return orig(*args, **kwargs)
+            wrapper._fm_sync = True
+            return wrapper
+
+        _CUDA_ORIGINALS.append((owner, name, orig))
+        setattr(owner, name, make())
 
 
 def _unpatch() -> None:
@@ -100,6 +143,9 @@ def _unpatch() -> None:
         for name, orig in _ORIGINALS.items():
             setattr(torch.Tensor, name, orig)
         _ORIGINALS.clear()
+        for owner, name, orig in _CUDA_ORIGINALS:
+            setattr(owner, name, orig)
+        _CUDA_ORIGINALS.clear()
         _PATCHED = False
 
 

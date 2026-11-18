@@ -42,7 +42,7 @@ import torch
 __all__ = ["time_call", "apply_fast_defaults", "tune_batch_size", "autotune",
            "autotune_kernels", "Report", "Trial"]
 
-_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "forgemind")
+
 
 
 @dataclass
@@ -243,9 +243,24 @@ def autotune(target, loader=None, *, build=None, budget_s: float = 60.0, apply: 
         if fused:
             from .kernels import available as kernels_available
             if kernels_available():
-                from .kernels.apply import enable
-                ms = measure("fused_kernels=on",
-                             lambda: enable(target.raw_model), note="rmsnorm+swiglu kernels")
+                from .kernels.apply import enable, revert
+                fused_state = {}
+
+                def _fused_setup():
+                    # Remember whether anything was already patched, so the teardown only
+                    # undoes what this trial did (audit BS-006: the trial previously had no
+                    # teardown and left the model mutated after an apply=False sweep).
+                    fused_state["patched"] = sum(
+                        1 for m in target.raw_model.modules()
+                        if getattr(m, "_fm_norm", False) or getattr(m, "_fm_mlp", False))
+                    enable(target.raw_model)
+
+                def _fused_teardown():
+                    if not fused_state.get("patched"):
+                        revert(target.raw_model)
+
+                ms = measure("fused_kernels=on", _fused_setup, _fused_teardown,
+                             note="rmsnorm+swiglu kernels")
                 if ms < best_ms:
                     best_ms, best = ms, {"fused_ops": True}
         if accum and getattr(target, "accum", 1) > 1:
@@ -279,58 +294,40 @@ def autotune(target, loader=None, *, build=None, budget_s: float = 60.0, apply: 
 
 
 def autotune_kernels(candidates=None, iters: int = 20, cache: bool = True) -> dict:
-    """Brute-force the Triton launch configs for this GPU and cache the winners.
+    """Measure the packed kernels on this GPU; ``{"skipped": ...}`` without CUDA.
 
-    Only the packed kernels whose block size is a free parameter are swept. On a machine
-    without CUDA this returns ``{"skipped": ...}`` instead of pretending.
+    Launch metadata is deliberately **not** swept here: the ``swiglu``/``add_rms_norm``
+    launches are already wrapped in ``_common.tune()`` -> ``triton.autotune`` (a real grid
+    over ``num_warps``/``num_stages`` picked on first launch -- the warmups below let that
+    hunt finish), and the RMS paths take their metadata from the ``num_warps_for``
+    heuristic, which has no free parameter for an external loop to turn. An earlier version
+    looped over ``block_m``/``warps``/``block`` labels without ever passing them to a
+    launch -- a placebo sweep, found by the v0.9 forensic audit (BS-001).
+
+    ``cache`` is accepted for backward compatibility only: launch winners live in triton's
+    in-process autotuner, and the file this used to write (``~/.cache/forgemind/triton.json``)
+    was never read back by anything.
+
+    Returns ``{kernel: {"ms": time}, "device": name}``.
     """
     from .kernels import available
     if not available():
         return {"skipped": "needs triton + an accelerator", "device": str(torch.device("cpu"))}
-    from .kernels import _common, norm, swiglu
+    from .kernels import norm, swiglu
 
     results = {}
     d = 4096
     x = torch.randn(1024, d, device="cuda")
     w = torch.randn(d, device="cuda")
-    best = (float("inf"), None)
-    for block_m in (1, 2, 4, 8):
-        if block_m * _common.next_pow2(d) > 16384:
-            continue
-        for warps in (4, 8, 16):
-            try:
-                fn = lambda: norm.rms_norm(x, w, 1e-6)
-                ms = time_call(fn, warmup=3, repeats=iters)
-            except Exception:
-                continue
-            if ms < best[0]:
-                best = (ms, dict(rows=block_m, num_warps=warps))
-    if best[1]:
-        results["rms_norm"] = dict(best[1], ms=best[0])
     g = torch.randn(1 << 20, device="cuda")
     u = torch.randn(1 << 20, device="cuda")
-    best = (float("inf"), None)
-    for block in (512, 1024, 2048, 4096):
-        for warps in (2, 4, 8):
-            try:
-                ms = time_call(lambda: swiglu.swiglu(g, u), warmup=3, repeats=iters)
-            except Exception:
-                continue
-            if ms < best[0]:
-                best = (ms, dict(block=block, num_warps=warps))
-    if best[1]:
-        results["swiglu"] = dict(best[1], ms=best[0])
+    for name, fn in (("rms_norm", lambda: norm.rms_norm(x, w, 1e-6)),
+                     ("swiglu", lambda: swiglu.swiglu(g, u))):
+        try:
+            results[name] = {"ms": time_call(fn, warmup=3, repeats=iters)}
+        except Exception as exc:  # OOM/launch failures are data, not crashes
+            results[name] = {"ms": float("nan"), "note": str(exc)[:80]}
     results["device"] = torch.cuda.get_device_name()
-    if cache:
-        with contextlib.suppress(Exception):
-            os.makedirs(_CACHE, exist_ok=True)
-            path = os.path.join(_CACHE, "triton.json")
-            old = {}
-            if os.path.exists(path):
-                old = json.load(open(path))
-            old[results["device"]] = results
-            json.dump(old, open(path, "w"), indent=1)
-            results["cached"] = path
     return results
 
 

@@ -330,7 +330,20 @@ class BatchStream:
         self._stop_worker()
         self._drain()
         self._drop_iterator()
-        self._epoch_len = _loader_len(self.loader) or self._epoch_len or None
+        # len(loader) is skip-aware while sampler.skip is pending (resume() sets it just
+        # before _restart), which would shrink _epoch_len to the *remaining* batches --
+        # the resumed epoch's `index >= _epoch_len` guard would then roll the epoch after
+        # a single batch and poison every later epoch (audit BUG-004). Measure the FULL
+        # epoch length with the skip held at 0; the iter() below still consumes it.
+        pending_skip = getattr(self.sampler, "skip", 0)
+        if pending_skip:
+            self.sampler.skip = 0
+        try:
+            full = _loader_len(self.loader)
+        finally:
+            if pending_skip:
+                self.sampler.skip = pending_skip
+        self._epoch_len = full or self._epoch_len or None
         if hasattr(self.sampler, "set_epoch"):
             self.sampler.set_epoch(self._start_epoch)
         self._it = iter(self.loader)

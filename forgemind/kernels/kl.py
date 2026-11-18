@@ -206,9 +206,12 @@ def kl_distill_loss(hs: torch.Tensor, ht: torch.Tensor, w: torch.Tensor, teacher
                     chunk: int = 4096) -> torch.Tensor:
     """Mean forward KL of ``softmax(teacher_head(ht)) || softmax(hs @ w.T)``.
 
-    The student logits never outlive a chunk and the gradient is written into the chunk's own
-    logits buffer, so peak memory is one ``[chunk, V]`` tile regardless of batch size. The
-    teacher runs under ``no_grad`` and its parameters never accumulate gradients.
+    The teacher runs under ``no_grad`` and its parameters never accumulate gradients.
+    Honest peak (audit PERF-003): each chunk's ``ctx.save_for_backward`` keeps that
+    chunk's ``[chunk, V]`` gradient until backward, so with ``student.requires_grad_``
+    the graph accumulates every chunk and peak memory is **N x V** end to end -- the same
+    as torch's own path, not the single tile an earlier docstring claimed. The
+    grad-free (``no_grad``) case really is one tile.
     """
     if not _kernel_ok(hs, ht):
         return fb.kl_distill_loss(hs, ht, w, teacher_head, chunk)

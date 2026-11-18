@@ -227,17 +227,23 @@ def main(argv=None):
             tensors = _case_tensors(case, op, a, dev, dtype)
             ms_eager = _bench(case, tensors, False, measure, a.iters, a.warmup)
             ms_kernel = _bench(case, tensors, True, measure, a.iters, a.warmup)
-            try:
-                if a.no_compile:
-                    raise RuntimeError("--no-compile")
-                ms_ind = _bench_case_fn(case, tensors, _compiled(case, False), measure,
-                                        a.iters, a.warmup)
-                ms_kernel_c = _bench_case_fn(case, tensors, _compiled(case, True), measure,
-                                             a.iters, a.warmup)
-            except Exception as exc:  # pragma: no cover - inductor unavailable/CPU
-                ms_ind = ms_kernel_c = float("nan")
-                if not a.no_compile:
-                    print(f"  ({case.name}: torch.compile unavailable: "
+            ms_ind = ms_kernel_c = float("nan")
+            if not a.no_compile:
+                # One try per compile: a shared block clobbered a successful inductor
+                # timing with NaN whenever our-op compilation raised afterwards
+                # (audit BS-003 -- the qk_norm_rope row's "inductor: nan (compile
+                # failed)" never proved *inductor* failed).
+                try:
+                    ms_ind = _bench_case_fn(case, tensors, _compiled(case, False), measure,
+                                            a.iters, a.warmup)
+                except Exception as exc:  # pragma: no cover - inductor unavailable/CPU
+                    print(f"  ({case.name}: inductor compile failed: "
+                          f"{type(exc).__name__}: {str(exc)[:120]})")
+                try:
+                    ms_kernel_c = _bench_case_fn(case, tensors, _compiled(case, True), measure,
+                                                 a.iters, a.warmup)
+                except Exception as exc:  # pragma: no cover - custom-op compile issues
+                    print(f"  ({case.name}: compiled-kernel compile failed: "
                           f"{type(exc).__name__}: {str(exc)[:120]})")
             rows.append(dict(op=case.name, shapes=case.shapes, eager=ms_eager, inductor=ms_ind,
                              kernel=ms_kernel, kernel_compiled=ms_kernel_c))

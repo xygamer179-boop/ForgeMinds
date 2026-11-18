@@ -782,10 +782,20 @@ on the user's GPU (hardware model not yet recorded — the round-trip asked for
 | add_rms_norm | x,delta [8192,4096] | 4.611 | 0.436 | 1.239 | 0.35x |
 | swiglu | gate,up [8192,11008] | 7.529 | 1.314 | 2.466 | 0.53x |
 | swiglu_split | [8192,22016] | 9.431 | 1.563 | 2.436 | 0.64x |
-| qk_norm_rope | [8,2048,32,128] | 13.538 | nan (compile failed) | 1.394 | 9.71x |
+| qk_norm_rope | [8,2048,32,128] | 13.538 | nan¹ | 1.394 | 9.71x |
 
-Four kernels lose to inductor; `qk_norm_rope` wins outright because inductor could
-not compile it. The gap has one obvious cause: every losing kernel was launched
+¹ **Attribution corrected by the v0.9 forensic audit (finding BS-003).** This run wrapped
+*both* compilations — inductor's reference **and** our-op compiled path — in one shared
+`try`, so an exception from *either* set both timings to NaN. The original "inductor could
+not compile it" reading of this cell was therefore not established by the data: nothing in
+this run says which side failed. `kbench` now compiles each side in its own `try` and prints
+a per-column `inductor compile failed:` / `compiled-kernel compile failed:` line — re-run
+`kbench --ops qk_norm_rope --check` on GPU to replace this cell. The 9.71x never depended
+on it: `_nanmin(eager, inductor)` fell back to **eager** (13.538 ms) as the baseline.
+
+Four kernels lose to inductor; `qk_norm_rope` beats its available baseline (eager —
+see footnote 1 for why the inductor cell is `nan`). The gap has one obvious cause:
+every losing kernel was launched
 with **fixed** metadata — warps from an element-count heuristic (`num_warps_for`,
 capped at 16), pipeline stages left at triton's default of 3, and no tuning of any
 kind. Inductor (and Liger, which these kernels follow) autotunes launch configs

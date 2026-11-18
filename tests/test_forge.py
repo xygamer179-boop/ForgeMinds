@@ -213,3 +213,94 @@ def test_logging_path_runs(capsys):
     out = capsys.readouterr().out
     assert out.count("step ") == 2          # logged on steps 2 and 4
     assert "loss" in out and "gnorm" in out
+
+
+# --------------------------------------------------------------------------------- v0.9 audit regressions
+def test_clip_zero_still_steps():
+    """BUG-001 (audit): ``clip=0`` is the documented "no clipping" setting; the NaN
+    grad-norm sentinel must not fail the finite check -- it used to skip 100% of steps."""
+    forge, _, _ = build(clip=0.0, max_steps=4)
+    x, y = data()
+    hist = forge.fit([(x, y)] * 6, max_steps=4)
+    assert len(hist) == 4
+    assert not any(h.get("skipped") for h in hist)
+
+
+def test_skipped_step_rearms_the_scaler():
+    """BUG-002 (audit): the skipped branch must call scaler.update() -- unscale_() already
+    ran, and without update() the next step's unscale_() raises 'already been called'."""
+    forge, _, _ = build(max_steps=2, accum=1)
+
+    class FakeScaler:
+        """Mimics GradScaler's unscale_/update arming protocol."""
+
+        def __init__(self):
+            self._armed = True
+            self.updates = 0
+
+        def scale(self, loss):
+            return loss
+
+        def unscale_(self, opt):
+            if not self._armed:
+                raise RuntimeError("unscale_() has already been called for this optimizer")
+            self._armed = False
+
+        def step(self, opt):
+            opt.step()
+
+        def update(self):
+            self.updates += 1
+            self._armed = True
+
+    sc = FakeScaler()
+    forge.scaler = sc
+    x, y = data()
+    forge._clip_coef = lambda: torch.tensor(float("nan"))        # force a skip
+    s1 = forge.step((x, y))
+    assert s1["skipped"] is True and sc.updates == 1             # update() ran on the skip
+    forge._clip_coef = lambda: torch.tensor(1.0)
+    s2 = forge.step((x, y))                                      # raises without the fix
+    assert s2["skipped"] is False
+
+
+def test_async_fit_trains_every_epoch():
+    """BUG-003 (audit): _AsyncLoader is one-shot and fit() used to reuse it across epochs,
+    so with the default async_batches=True epochs >= 1 silently trained on zero batches."""
+    forge, _, _ = build(max_steps=100, log_every=10**9)
+    x, y = data()
+    loader = [(x[i:i + 16], y[i:i + 16]) for i in range(0, 64, 16)]   # 4 batches per epoch
+    hist = forge.fit(loader, epochs=3, max_steps=100)
+    assert len(hist) == 12              # all three epochs trained (was 4 before the fix)
+
+
+def test_forge_clip_flushes_offloaded_grads():
+    """BUG-007 (audit): Forge._clip_coef must use the optimizer's own clip (which collects
+    pending offloaded grads first); plain clip_grad_norm_ over model.parameters() would
+    miss every moved gradient and apply the update unclipped."""
+    forge, _, _ = build(offload="optimizer", max_steps=2, clip=0.5)
+    off = forge.optimizer
+    assert hasattr(off, "clip_grad_norm_"), "offload='optimizer' should build OffloadedAdamW"
+    calls = []
+    real = off.clip_grad_norm_
+
+    def spy(max_norm):
+        calls.append(max_norm)
+        return real(max_norm)
+
+    off.clip_grad_norm_ = spy
+    x, y = data()
+    st = forge.step((x, y))
+    assert st is not None
+    assert calls == [0.5]                # the flushing clip ran, not just the plain one
+
+
+def test_evaluate_is_a_float_mean():
+    """PERF-006 (audit): evaluate() now accumulates on device (one host read). The value
+    contract must not change."""
+    forge, _, _ = build(max_steps=2)
+    x, y = data()
+    loader = [(x[i:i + 16], y[i:i + 16]) for i in range(0, 64, 16)]
+    got = forge.evaluate(loader)
+    ref = float(sum(forge._extract_loss(forge._call_with_batch(b), b) for b in loader) / len(loader))
+    assert got == pytest.approx(ref, rel=1e-5)

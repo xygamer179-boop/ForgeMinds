@@ -389,3 +389,28 @@ def test_async_loader_releases_worker_processes_on_close():
     assert all(not w.is_alive() for w in workers), "worker pool still running after close()"
     with pytest.raises(StopIteration):     # a closed stream is an exhausted stream
         next(gen)
+
+
+class SkipAwareLoader(OrderedLoader):
+    """Mirrors the real DataLoader: len() goes through the sampler, so a pending resume
+    skip *shrinks* it -- the BUG-004 mechanism."""
+
+    def __len__(self):
+        return (len(self.sampler) + self.batch_size - 1) // self.batch_size
+
+
+def test_resume_keeps_the_full_epoch_length():
+    """BUG-004 (audit): _restart measured len(loader) while sampler.skip was pending, so
+    _epoch_len became the *remaining* count and the resumed epoch rolled to the next epoch
+    after a single batch."""
+    sampler = ResumableSampler(6 * 4, 0, 1, seed=0, shuffle=False)
+    loader = SkipAwareLoader(6, sampler)
+    stream = BatchStream(loader, sampler, torch.device("cpu"), prefetch=True, depth=2,
+                         threaded=True)        # the index>=_epoch_len guard lives in _run
+    stream.resume(0, 3)
+    got = []
+    for _ in range(3):
+        ids, _labels = stream.next()
+        got.append(int(ids[0]))
+    stream.close()
+    assert got == [3, 4, 5]   # remaining epoch-0 batches (the poisoned _epoch_len yielded [3, 0, 1])

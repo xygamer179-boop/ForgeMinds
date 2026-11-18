@@ -66,6 +66,7 @@ def _patch_norm(m: nn.Module) -> None:
         e = torch.finfo(x.dtype).eps if eps is None else eps
         return rms_norm(x, self.weight.to(x.dtype), e)
 
+    m._fm_orig_forward = m.__dict__.get("forward")   # None => class-level forward (see revert)
     m.forward = types.MethodType(forward, m)
 
 
@@ -85,6 +86,7 @@ def _patch_swiglu_split(m: nn.Module) -> None:
             fused.bias.copy_(torch.cat([w1.bias, w3.bias], 0))
     del m.w1, m.w3
     m.gate_up = fused
+    m._fm_structural = True           # Parameter rewiring -- revert() must not undo this
 
     def forward(self, x):
         return self.w2(_split_apply(self.gate_up(x)))
@@ -100,6 +102,7 @@ def _patch_swiglu(m: nn.Module) -> None:
     def forward(self, x):
         return self.w2(swiglu(self.w1(x), self.w3(x)))
 
+    m._fm_orig_forward = m.__dict__.get("forward")   # None => class-level forward (see revert)
     m.forward = types.MethodType(forward, m)
 
 
@@ -192,4 +195,32 @@ def enable(model: nn.Module, norm: bool = True, swiglu_mlp: bool = True,
     return model
 
 
-__all__ = ["patch", "enable", "rms_norm", "add_rms_norm", "swiglu"]
+def revert(module: nn.Module) -> nn.Module:
+    """Undo :func:`patch`/:func:`enable` on ``module``'s tree; returns ``module``.
+
+    Forward-swapped norms/MLPs get their original ``forward`` back and their
+    ``_fm_norm``/``_fm_mlp`` flags are cleared. Structural patches (``split=True``, which
+    rewires Parameters: ``w1``/``w3`` -> ``gate_up``) are **left in place** and counted in
+    ``module._fm_fused_reverted`` -- rebuilding those Parameters would orphan the tensors
+    an optimizer already holds. Idempotent; used as the autotune fused-trial teardown so a
+    measurement run never leaves the model mutated (audit BS-006).
+    """
+    restored = structural = 0
+    for m in module.modules():
+        if getattr(m, "_fm_structural", False):
+            structural += 1
+        if hasattr(m, "_fm_orig_forward"):
+            orig = m._fm_orig_forward
+            if orig is None:
+                m.__dict__.pop("forward", None)
+            else:
+                m.forward = orig
+            del m._fm_orig_forward
+            m.__dict__.pop("_fm_norm", None)
+            m.__dict__.pop("_fm_mlp", None)
+            restored += 1
+    module._fm_fused_reverted = {"restored": restored, "structural": structural}
+    return module
+
+
+__all__ = ["patch", "enable", "revert", "rms_norm", "add_rms_norm", "swiglu"]

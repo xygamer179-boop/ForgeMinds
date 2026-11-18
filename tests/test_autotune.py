@@ -121,3 +121,51 @@ def test_autotune_cli_kernels():
     assert out.returncode == 0, out.stderr[-2000:]
     payload = json.loads(out.stdout)
     assert "skipped" in payload or "device" in payload
+
+
+def _norm_model():
+    class NetN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = nn.RMSNorm(16)
+            self.f = nn.Sequential(nn.Linear(4, 16), nn.Linear(16, 1))
+
+        def forward(self, x, y=None):
+            return self.f[1](self.f[0](x) + self.norm(self.f[0](x)))
+
+    torch.manual_seed(0)
+    m = NetN()
+    return fm.Forge(m, torch.optim.AdamW(m.parameters(), lr=1e-2), precision="fp32",
+                    quiet=True, loss_fn=lambda o, b: F.mse_loss(o, b[1])), m
+
+
+def test_fused_trial_reverts_its_own_patches(monkeypatch):
+    """BS-006 (audit): the fused autotune trial used to have no teardown, so an
+    apply=False sweep left the model permanently patched."""
+    import forgemind.kernels as K
+
+    monkeypatch.setattr(K, "available", lambda: True)
+    forge, model = _norm_model()
+    x, y = torch.randn(16, 4), torch.randn(16, 1)
+    norms = [m for m in model.modules() if isinstance(m, nn.RMSNorm)]
+    assert norms, "fixture must contain a patchable RMSNorm"
+    rep = at.autotune(forge, [(x, y)], budget_s=30, precision=False, accum=False,
+                      fused=True)
+    assert rep.baseline_ms > 0
+    assert not any(getattr(m, "_fm_norm", False) for m in norms)   # reverted after the trial
+
+
+def test_fused_trial_respects_preexisting_patches(monkeypatch):
+    """The teardown may only undo what the trial itself did."""
+    import forgemind.kernels as K
+    from forgemind.kernels.apply import enable
+
+    forge, model = _norm_model()
+    enable(model)
+    assert any(getattr(m, "_fm_norm", False) for m in model.modules())
+    monkeypatch.setattr(K, "available", lambda: True)
+    x, y = torch.randn(16, 4), torch.randn(16, 1)
+    rep = at.autotune(forge, [(x, y)], budget_s=30, precision=False, accum=False,
+                      fused=True)
+    assert rep.baseline_ms > 0
+    assert any(getattr(m, "_fm_norm", False) for m in model.modules())  # left alone

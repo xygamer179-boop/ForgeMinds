@@ -45,6 +45,7 @@ and why) is in [OFFLOAD.md](OFFLOAD.md).
 11. [Verified vs not verified](#11-verified-vs-not-verified)
 12. [Troubleshooting](#12-troubleshooting)
 13. [Repository map](#13-repository-map)
+14. [v0.9 forensic audit remediations](#14-v09-forensic-audit-remediations)
 
 ---
 
@@ -551,6 +552,14 @@ cfg.offload.experts = True         # stream only the *active* experts for MoE
 `OffloadedAdamW` is numerically identical to `AdamW` (bit-exact against the serial path, chunk counts
 1/2/3/5) and reports where its time goes:
 
+**Honest status of the chunked overlap (v0.9 audit BS-002).** The chunk pipeline in
+`offload.py` (per-chunk events, staging buffers, pending list) exists and is correct, but in
+the standard `Trainer` flow it never engages: `collect()` runs every micro-batch, and
+`clip_grad_norm_` flushes the rest before `step()`, so `_pending` is always empty when the
+optimizer starts. D2H, clipping and the host Adam update are therefore **serialized** today;
+`pipeline_chunks` sizes the machinery rather than producing overlap. Read timings from
+`trainer.opt.report()`, not from overlap assumptions.
+
 ```python
 trainer.opt.report()
 ```
@@ -737,7 +746,12 @@ identically shaped matrices costs one call per shape bucket, not one per matrix.
   `torch.float32` for maximum accuracy -- the kernels accept either;
 * multi-GPU: each shape bucket is computed on a disjoint `rank::world` share and combined
   with **one** `all_reduce`; with `world == 1` (or no `torch.distributed` at all) there is
-  not a single collective call;
+  not a single collective call. The combine group defaults to the **world** group, which is
+  only correct when every rank holds the same parameters (plain DDP): under TP/PP/EP the
+  buckets differ per rank, so pass `fm.Muon(..., group=dp_group)` -- your replication group;
+* embeddings follow the same `ndim >= 2` rule as everything else: token embeddings and an
+  untied `lm_head` (`[V, d]`) are 2-D and therefore get Muon. Recipes that want them on
+  AdamW must say so explicitly with `use_muon=False` param-group dicts;
 * the update never touches `p.grad` or the momentum buffer in place (the reference Muon
   file this was ported from did both -- the six found bugs are listed in
   [PERF.md section 11](PERF.md) and each has a regression test in `tests/test_muon.py`).
@@ -863,11 +877,12 @@ fail fast on every rank. `seed_everything` seeds torch/python/numpy (plus
 
 ```python
 fm.Muon(params, lr=0.02, weight_decay=0.0, momentum=0.95, nesterov=True, ns_steps=5,
-        ns_dtype=torch.bfloat16, betas=(0.9, 0.95), eps=1e-10, adam_lr=None)
+        ns_dtype=torch.bfloat16, betas=(0.9, 0.95), eps=1e-10, adam_lr=None, group=None)
 ```
 
 | detail | behavior |
 |---|---|
+| `group` | process group for the multi-GPU NS combine (default `None` = world); must be a group over which the parameters are **replicated** -- pass your DP group under TP/PP/EP (audit BUG-006) |
 | `params` | iterable of tensors (auto-split: `ndim >= 2` -> Muon, else AdamW) or param-group dicts; generators are fine |
 | group dicts | `use_muon=True/False` selects the update; without the flag the group is split by `ndim` keeping its hyperparameters; unknown keys pass through |
 | state | Muon: `momentum_buffer`; AdamW: `exp_avg`, `exp_avg_sq`, `step` (per parameter) |
@@ -911,6 +926,12 @@ fm.count_host_syncs(capture_stack=True, count_cpu=False)   # context manager; .c
 fm.host_syncs() -> int                                     # running total
 fm.OffloadedAdamW(param_groups, lr, betas=(0.9, 0.95), eps=1e-8, cfg: OffloadConfig = None,
                   overlap=True)                            # .report(), .state_dict()
+
+The sync counter patches tensor reads (`item`, `tolist`, `numpy`, `__float__`/`__int__`/
+`__bool__`, `cpu`) **and** explicit `torch.cuda.synchronize()` / `Stream.synchronize()` /
+`Event.synchronize()` calls -- the offload flush uses the latter two, which were invisible
+until the v0.9 audit (BS-006). Distributed collectives are deliberately out of scope: they
+are device-side network operations, not host<->device reads.
 fm.autotune.apply_fast_defaults(device=None, allow_tf32=True, allocator=True) -> dict
 fm.autotune.tune_batch_size(step_fn, candidates=(1,2,4,...), *, warmup=1, repeats=3,
                             min_gain=0.02, footprint=None, report=None) -> (int, float)
@@ -1281,3 +1302,39 @@ regressions, bucketed batching, compile dispatch, subprocess mp check), `test_au
 (DeepSpeed config generation), `test_nn_blocks.py` (the blocks and `patch` are drop-in
 compatible with torch, differentiable, and trainable in a hand-written model), `test_docs.py` (these documents: every documented `fm.*` name must
 exist, every anchor must resolve, every config field must be documented).
+
+---
+
+## 14. v0.9 forensic audit remediations
+
+An external "forensic code audit" (a user-generated, self-labelled *unverified* report)
+listed 20 findings against v0.9.0. Every one was verified line-by-line against the code;
+the per-finding evidence, verdicts (14 confirmed, 4 partial, 2 rebutted-in-part) and the
+fix rationale live in `AUDIT_TRIAGE.md` at the repository root. Summary of what changed:
+
+| finding | status in this tree |
+|---|---|
+| BS-001 placebo kernel sweep + dead `triton.json` | **fixed**: `autotune_kernels()` now measures real tuned launches (warmups let `_common.tune()`'s `triton.autotune` grid hunt finish) and no longer writes a file nothing read; the fake `block_m`/`warps`/`block` loops are gone |
+| BS-002 offload overlap never engages | **documented honestly** (§5.7): the chunk pipeline is correct but the Trainer flow serializes D2H/clip/Adam; enabling true overlap needs a per-chunk buffer redesign, not a flag |
+| BS-003 kbench NaN clobber | **fixed**: each compile gets its own `try`; `PERF.md` §13's qk_norm_rope `nan` cell re-attributed (the 9.71x baseline was eager all along) |
+| BS-004 fake lazy imports | **fixed**: `import forgemind` no longer imports `forgemind.kernels`, `triton` or `torch._dynamo` (measured 3.9 s -> 1.4 s); the dynamo decorators in `moe.py` are applied at construction time |
+| BS-005 enable() scope vs showcase kernels | **documented**: `enable()` is documented truthfully as RMSNorm+SwiGLU only; the wiring gaps (Router uses torch `softmax`/`topk`, GPT has its own rope, KL has no `custom_op`) are real opportunities, not mislabels -- rewiring is GPU-benchmarkable work, not done blind |
+| BS-006 sync counter blind spots / non-reverted autotune trial | **fixed**: the counter now includes `torch.cuda`/`Stream`/`Event.synchronize`; the fused autotune trial gained a `teardown=` via the new `fm.kernels.revert()` |
+| BUG-001 `clip=0` skips every step | **fixed**: the disabled-clip NaN sentinel no longer fails the finite check (default `clip=1.0` unchanged) |
+| BUG-002 fp16 skip path skips `scaler.update()` | **fixed**: `update()` runs on the skipped branch, so the next `unscale_()` does not raise |
+| BUG-003 one-shot async loader, `epochs>1` empty | **fixed**: `Forge.fit` builds a fresh loader wrapper per epoch and shuts it down |
+| BUG-004 resume poisons `_epoch_len` | **fixed**: `_restart` measures the *full* epoch length with the sampler skip held at 0 |
+| BUG-005 contiguity guards | **part fixed, part rebutted**: `qk_norm_rope` now requires contiguous `x`/`w` (eager gate + defensive copies in the custom-op path); the "`reshape(-1, n)` raises" claim is false (reshape copies -- verified), and the KL strides claim is likewise defeated by the reshape |
+| BUG-006 Muon embeddings / WORLD combine | **part fixed, part documented**: `fm.Muon(..., group=)` selects the combine group (TP/PP/EP pass their DP group); the `ndim >= 2` embedding rule is now stated explicitly (§5.14) |
+| BUG-007 Forge clip misses offloaded grads | **fixed**: `_clip_coef` prefers the optimizer's own clip (which flushes first); the narrow rank-local spike-skip caveat under DDP is documented rather than silently assumed |
+| BUG-008 port leftovers (stale `dW` cast, hardcoded eps) | **fixed**: `dW` integrates the same fp32 `normed` the forward multiplies with, and the backward passes the caller's real `eps` to the self-check key |
+| PERF-001/002/004 structural kernel costs | **documented as design costs** (serial kill passes in topk, three-pass softmax with output-dtype exp rounding, double store of the mathematically identical `dx==ddelta`): real, correct, and not "fixed" without GPU-benchmarkable rewrites -- returning aliased grads would be an autograd hazard |
+| PERF-003 KL peak docstring overclaim | **fixed**: docstring now states N x V peak with grads (same as torch), one tile only grad-free |
+| PERF-005 EP per-param `all_reduce` | **fixed**: `all_reduce_coalesced` (with a per-tensor fallback); the per-expert dispatch loop stays until it can be GPU-benchmarked |
+| PERF-006 Forge `no_sync` / eval stalls / double moves | **fixed**: Forge now mirrors Trainer's `no_sync()` during accumulation, and `evaluate` does one host read per eval; the "double batch moves" claim was rebutted (same-device `.to()` is a no-op) |
+
+Gates after remediation: CPU `pytest tests/ -q`, `TRITON_INTERPRET=1 pytest tests/ -q`,
+`tests/kernel_interp_check.py` (66 checks), `tools/tilelens_probe.py`, docs tests, scoped
+pyflakes. GPU speed claims stay on the user's hardware: re-run
+`python -m forgemind.cli kbench --ops rms_norm,add_rms_norm,swiglu,swiglu_split,qk_norm_rope --check`
+for the "after" table against `PERF.md` §13.
