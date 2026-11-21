@@ -65,6 +65,10 @@ _NEG_INF = -float("inf")
 _NEG_BIG = -1e30
 
 if triton_available():
+    # constexpr-instantiated (not bare python floats): triton >= 3.2 refuses plain module
+    # globals inside @jit bodies, and the interpreter accepts these either way.
+    _NEG_INF = tl.constexpr(_NEG_INF)
+    _NEG_BIG = tl.constexpr(_NEG_BIG)
 
     @triton.jit
     def _kl_fwd_bwd_kernel(S_ptr, s_stride, T_ptr, t_stride, G_ptr, g_stride, Loss_ptr, V, inv_N,

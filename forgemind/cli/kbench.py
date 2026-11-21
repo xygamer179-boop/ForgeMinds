@@ -217,18 +217,28 @@ def main(argv=None):
 
     measure = _timer(dev)
     backward = a.mode in ("bwd", "both")
-    rows, worst = [], None
+    rows, worst, failed = [], None, []
     print(f"[kbench] device={dev} dtype={a.dtype} mode={a.mode} "
           f"iters={a.iters} kernels={'triton' if not cpu else 'torch fallback'}")
     for op in [o.strip() for o in a.ops.split(",") if o.strip()]:
         for case in _cases(op, a.tokens, a.dim, a.hidden, a.batch, a.seq, a.heads, a.head_dim,
                            a.vocab, a.dtype):
-            case.backward = backward and case.backward
-            tensors = _case_tensors(case, op, a, dev, dtype)
-            ms_eager = _bench(case, tensors, False, measure, a.iters, a.warmup)
-            ms_kernel = _bench(case, tensors, True, measure, a.iters, a.warmup)
-            ms_ind = ms_kernel_c = float("nan")
             if not a.no_compile:
+                # Fresh dynamo cache per case: compiling several shapes in one process trips
+                # FailOnRecompileLimitHit (fullgraph=True) and leaves inductor cells as nan.
+                torch._dynamo.reset()
+            tensors = None
+            ms_eager = ms_kernel = float("nan")
+            try:
+                case.backward = backward and case.backward
+                tensors = _case_tensors(case, op, a, dev, dtype)
+                ms_eager = _bench(case, tensors, False, measure, a.iters, a.warmup)
+                ms_kernel = _bench(case, tensors, True, measure, a.iters, a.warmup)
+            except Exception as exc:  # a kernel compile/run failure is a row, not a crash
+                failed.append((case.name, f"{type(exc).__name__}: {str(exc)[:200]}"))
+                print(f"  ({case.name}: BENCH FAILED -- {type(exc).__name__}: {str(exc)[:160]})")
+            ms_ind = ms_kernel_c = float("nan")
+            if not a.no_compile and tensors is not None:
                 # One try per compile: a shared block clobbered a successful inductor
                 # timing with NaN whenever our-op compilation raised afterwards
                 # (audit BS-003 -- the qk_norm_rope row's "inductor: nan (compile
@@ -266,6 +276,10 @@ def main(argv=None):
         print(f"[kbench] wrote {a.json}")
 
     if a.check:
+        if failed:
+            for name, err in failed:
+                print(f"[kbench] FAIL: {name} errored: {err}")
+            return 3
         if worst is not None:
             print(f"[kbench] FAIL: {worst[0]} is {worst[1]:.2f}x vs {a.baseline} "
                   f"(tolerance {a.tolerance:.0%})")
