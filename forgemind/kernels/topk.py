@@ -50,6 +50,10 @@ _HUGE = 1 << 62     # int64 sentinel for "not selected" (never a real index)
 
 
 if triton_available():
+    # triton >= 3.2 rejects bare python globals referenced inside @jit bodies; instantiate
+    # them as constexpr (same values) so the kernels compile on every triton version.
+    _E_BLOCK = tl.constexpr(_E_BLOCK)
+    _HUGE = tl.constexpr(_HUGE)
 
     @triton.jit
     def _topk_threshold_kernel(T, X, N, K, M, STRIDE, BLOCK: tl.constexpr):
@@ -59,7 +63,11 @@ if triton_available():
         lanes = tl.arange(0, BLOCK)
         sidx = lanes * STRIDE
         valid = (lanes < M) & (sidx < N)
-        sv = tl.load(X + row + sidx, mask=valid, other=float("-inf"))
+        # fp32 from the load: `last = float("-inf")` makes the loop-carried scalar fp32,
+        # and `last = val` from a bf16 X used to re-assign it to bf16 -- Triton rejects
+        # that at compile time ("Loop-carried variable last has initial type fp32 but is
+        # re-assigned to bf16"). Compute in fp32, cast once at the output edge.
+        sv = tl.load(X + row + sidx, mask=valid, other=float("-inf")).to(tl.float32)
         sv = tl.where(sv == sv, sv, float("inf"))        # NaN -> +inf for comparisons
         alive = valid
         last = float("-inf")
@@ -67,7 +75,7 @@ if triton_available():
         while it < K:                                    # dynamic bound: no unroll blow-up
             masked = tl.where(alive, sv, float("-inf"))
             pos = tl.argmax(masked, 0)                      # any max lane is fine for a value
-            val = tl.sum(tl.where(lanes == pos, sv, 0), axis=0)  # the value AT that lane (ties safe)
+            val = tl.sum(tl.where(lanes == pos, sv, 0.0), axis=0)  # value AT that lane (ties safe)
             alive = alive & (lanes != pos)               # kill exactly one sample element
             last = val
             it += 1
@@ -84,12 +92,12 @@ if triton_available():
         t = tl.load(T + pid)
 
         # ---- pass 1: how many sit strictly above the estimate -----------------------
-        c = 0
+        c = 0.0
         start = 0
         while start < N:
             off = start + lanes
             m = off < N
-            xr = tl.load(X + row + off, mask=m, other=0.0)
+            xr = tl.load(X + row + off, mask=m, other=0.0).to(tl.float32)
             xv = tl.where(xr == xr, xr, float("inf"))     # NaN -> +inf
             c += tl.sum((((xv > t) & m)).to(tl.float32), axis=0)
             start += BLOCK
@@ -112,7 +120,7 @@ if triton_available():
                 while start < N:
                     off = start + lanes
                     m = off < N
-                    xr = tl.load(X + row + off, mask=m, other=0.0)
+                    xr = tl.load(X + row + off, mask=m, other=0.0).to(tl.float32)
                     xv = tl.where(xr == xr, xr, float("inf"))
                     worse = (xv < m_k) | ((xv == m_k) & (off > p_k))
                     sub = m & (xv > t) & worse
@@ -130,12 +138,12 @@ if triton_available():
                 it += 1
             pivot = last
             # recount against the exact pivot (q < K always holds: pivot IS the row's k-th)
-            q = 0
+            q = 0.0
             start = 0
             while start < N:
                 off = start + lanes
                 m = off < N
-                xr = tl.load(X + row + off, mask=m, other=0.0)
+                xr = tl.load(X + row + off, mask=m, other=0.0).to(tl.float32)
                 xv = tl.where(xr == xr, xr, float("inf"))
                 q += tl.sum((((xv > pivot) & m)).to(tl.float32), axis=0)
                 start += BLOCK
@@ -147,7 +155,7 @@ if triton_available():
         while start < N:
             off = start + lanes
             m = off < N
-            xr = tl.load(X + row + off, mask=m, other=0.0)
+            xr = tl.load(X + row + off, mask=m, other=0.0).to(tl.float32)
             xv = tl.where(xr == xr, xr, float("inf"))
             gt = (xv > pivot) & m
             gtf = gt.to(tl.float32)
@@ -168,7 +176,7 @@ if triton_available():
             while start < N:
                 off = start + lanes
                 m = off < N
-                xr = tl.load(X + row + off, mask=m, other=0.0)
+                xr = tl.load(X + row + off, mask=m, other=0.0).to(tl.float32)
                 xv = tl.where(xr == xr, xr, float("inf"))
                 eq = (xv == pivot) & m & (off > prev)
                 best = tl.minimum(best, tl.min(tl.where(eq, off, N + 1), axis=0))
@@ -179,7 +187,7 @@ if triton_available():
             while start < N:
                 off = start + lanes
                 m = off < N
-                xr = tl.load(X + row + off, mask=m, other=0.0)
+                xr = tl.load(X + row + off, mask=m, other=0.0).to(tl.float32)
                 orig += tl.sum(tl.where((off == best) & m, xr, 0), axis=0)
                 start += BLOCK
             tl.store(out_v + qi + i, orig, mask=best <= N)
@@ -230,7 +238,9 @@ def _fused(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     r = rows.shape[0]
     m = min(n, max(2 * k, 256))
     stride = max(1, n // m)
-    t = torch.empty(r, dtype=rows.dtype, device=rows.device)
+    # fp32 scratch: the estimate is compared against fp32 loads in the select kernel and
+    # must not round through the input dtype (also unifies pivot's type on both branches).
+    t = torch.empty(r, dtype=torch.float32, device=rows.device)
     _topk_threshold_kernel[(r,)](t, rows, n, k, m, stride, _K1_BLOCK,
                                  num_warps=num_warps_for(_K1_BLOCK))
     values = torch.empty(r, k, dtype=rows.dtype, device=rows.device)
