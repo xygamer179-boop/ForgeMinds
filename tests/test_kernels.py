@@ -112,6 +112,112 @@ def test_qk_norm_rope_grad_matches_torch_autograd():
     assert torch.allclose(wk.grad, wr.grad, atol=5e-6, rtol=1e-4)
 
 
+def test_relu_squared_matches_torch():
+    torch.manual_seed(0)
+    x = torch.randn(33)
+    assert torch.allclose(kernels.relu_squared(x), torch.relu(x) ** 2, atol=1e-6, rtol=1e-5)
+
+
+def test_relu_squared_grad_matches_torch():
+    torch.manual_seed(0)
+    x = torch.randn(24, requires_grad=True)
+    g = torch.randn(24)
+    a = kernels.relu_squared(x)
+    a.backward(g)
+    xr = x.detach().clone().requires_grad_(True)
+    (torch.relu(xr) ** 2).backward(g)
+    assert torch.allclose(x.grad, xr.grad, atol=1e-6, rtol=1e-5)
+
+
+def test_geglu_matches_torch():
+    torch.manual_seed(0)
+    gate, up = torch.randn(5, 16), torch.randn(5, 16)
+    exp = F.gelu(gate, approximate="none") * up
+    assert torch.allclose(kernels.geglu(gate, up), exp, atol=1e-6, rtol=1e-5)
+
+
+def test_geglu_grad_matches_torch():
+    torch.manual_seed(0)
+    gate = torch.randn(12, requires_grad=True)
+    up = torch.randn(12, requires_grad=True)
+    g = torch.randn(12)
+    kernels.geglu(gate, up).backward(g)
+    gr = gate.detach().clone().requires_grad_(True)
+    ur = up.detach().clone().requires_grad_(True)
+    (F.gelu(gr, approximate="none") * ur).backward(g)
+    assert torch.allclose(gate.grad, gr.grad, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(up.grad, ur.grad, atol=1e-6, rtol=1e-5)
+
+
+def test_layer_norm_matches_torch():
+    torch.manual_seed(0)
+    for n, d in ((5, 8), (4, 16)):
+        x, w, b = torch.randn(n, d), torch.randn(d), torch.randn(d)
+        exp = F.layer_norm(x, (d,), w, b, 1e-5)
+        assert torch.allclose(kernels.layer_norm(x, w, b, 1e-5), exp, atol=1e-6, rtol=1e-5)
+        exp_nb = F.layer_norm(x, (d,), w, None, 1e-5)
+        assert torch.allclose(kernels.layer_norm(x, w, None, 1e-5), exp_nb,
+                              atol=1e-6, rtol=1e-5)
+
+
+def test_layer_norm_grads_match_torch():
+    torch.manual_seed(0)
+    n, d = 6, 8
+    x, w, b = torch.randn(n, d), torch.randn(d), torch.randn(d)
+    g = torch.randn(n, d)
+    xi, wi, bi = (t.clone().requires_grad_(True) for t in (x, w, b))
+    kernels.layer_norm(xi, wi, bi, 1e-5).backward(g)
+    xr, wr, br = (t.clone().requires_grad_(True) for t in (x, w, b))
+    F.layer_norm(xr, (d,), wr, br, 1e-5).backward(g)
+    assert torch.allclose(xi.grad, xr.grad, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(wi.grad, wr.grad, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(bi.grad, br.grad, atol=1e-6, rtol=1e-5)
+
+
+def test_cross_entropy_matches_torch():
+    torch.manual_seed(0)
+    logits = torch.randn(6, 40)
+    targets = torch.randint(0, 40, (6,))
+    for reduction in ("mean", "sum", "none"):
+        got = kernels.cross_entropy(logits, targets, reduction=reduction)
+        exp = F.cross_entropy(logits, targets, reduction=reduction)
+        assert torch.allclose(got, exp, atol=1e-6, rtol=1e-5), reduction
+    ign = targets.clone()
+    ign[1] = -100
+    got = kernels.cross_entropy(logits, ign, label_smoothing=0.1)
+    exp = F.cross_entropy(logits, ign, label_smoothing=0.1)
+    assert torch.allclose(got, exp, atol=1e-6, rtol=1e-5)
+
+
+def test_cross_entropy_grad_matches_torch():
+    torch.manual_seed(0)
+    logits = torch.randn(6, 40)
+    targets = torch.randint(0, 40, (6,))
+    targets[2] = -100
+    g = torch.randn(())
+    li = logits.clone().requires_grad_(True)
+    kernels.cross_entropy(li, targets, label_smoothing=0.1).backward(g)
+    lr = logits.clone().requires_grad_(True)
+    F.cross_entropy(lr, targets, label_smoothing=0.1).backward(g)
+    assert torch.allclose(li.grad, lr.grad, atol=1e-6, rtol=1e-5)
+
+
+def test_cross_entropy_non_contiguous_logits():
+    """Regression for Liger #1674: a strided view must not corrupt the gradient."""
+    torch.manual_seed(0)
+    base = torch.randn(6, 80)
+    logits = base[:, ::2]                      # [6, 40], stride (80, 2): non-contiguous
+    assert not logits.is_contiguous()
+    targets = torch.randint(0, 40, (6,))
+    li = logits.clone().requires_grad_(True)
+    kernels.cross_entropy(li, targets).backward()
+    lr = logits.clone().requires_grad_(True)
+    F.cross_entropy(lr, targets).backward()
+    assert torch.allclose(li.grad, lr.grad, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(kernels.cross_entropy(logits, targets),
+                          F.cross_entropy(logits, targets), atol=1e-6, rtol=1e-5)
+
+
 def test_kl_matches_torch_kl_div():
     torch.manual_seed(0)
     s, t = torch.randn(6, 40), torch.randn(6, 40)

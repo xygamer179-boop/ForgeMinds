@@ -82,12 +82,31 @@ def _cases():
     def rope(t):
         return fm.kernels.qk_norm_rope(t[0], t[1], t[2], t[3], 1e-6)
 
+    ln_w, ln_b = torch.randn(16), torch.randn(16)
+    logits, tgt = torch.randn(6, 40), torch.randint(0, 40, (6,))
+
+    def lay(t):
+        return fm.kernels.layer_norm(t[0], t[1], t[2], 1e-5)
+
+    def ggl(t):
+        return fm.kernels.geglu(t[0], t[1])
+
+    def rl2(t):
+        return fm.kernels.relu_squared(t[0])
+
+    def cen(t):
+        return fm.kernels.cross_entropy(t[0], t[1])
+
     return [
         ("rms_norm", rms, [x, w]),
         ("add_rms_norm", addrms, [x, x.clone(), w]),
+        ("layer_norm", lay, [x, ln_w, ln_b]),
         ("swiglu", swig, [gate, up]),
         ("swiglu_split", swigs, [split]),
+        ("geglu", ggl, [gate, up]),
+        ("relu_squared", rl2, [x]),
         ("qk_norm_rope", rope, [xr, wr, cos, sin]),
+        ("cross_entropy", cen, [logits, tgt]),
     ]
 
 
@@ -112,7 +131,8 @@ def test_op_path_is_numerically_identical_to_the_eager_path(name, fn, inputs):
 @needs_ops
 def test_all_ops_are_registered():
     names = {n for n in dir(torch.ops.forgemind) if not n.startswith("_")}
-    for op in ("rms_norm", "add_rms_norm", "swiglu", "swiglu_split", "qk_norm_rope"):
+    for op in ("rms_norm", "add_rms_norm", "layer_norm", "swiglu", "swiglu_split",
+               "geglu", "relu_squared", "qk_norm_rope", "cross_entropy"):
         assert op in names, op
         assert f"{op}_backward" in names, f"{op}_backward"
 
