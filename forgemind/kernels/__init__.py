@@ -6,7 +6,11 @@ available -- so importing this package never breaks a CPU or MPS run.
 
     import forgemind as fm
     y = fm.kernels.rms_norm(x, w, 1e-6)          # == F.rms_norm(x, (x.shape[-1],), w, eps)
+    y = fm.kernels.layer_norm(x, w, b, 1e-5)     # == F.layer_norm(x, (d,), w, b, eps)
     y = fm.kernels.swiglu(gate, up)              # == F.silu(gate) * up
+    y = fm.kernels.geglu(gate, up)               # == F.gelu(gate) * up
+    y = fm.kernels.relu_squared(x)               # == torch.relu(x) ** 2
+    loss = fm.kernels.cross_entropy(logits, y)   # == F.cross_entropy(logits, y)
     y = fm.kernels.swiglu_split(gate_up)         # fused gate|up projection output
     y = fm.kernels.qk_norm_rope(q, w, cos, sin)  # per-head RMSNorm + RoPE
     loss = fm.kernels.kl_distill_loss(hs, ht, w, teacher_head)   # KL(teacher || student)
@@ -31,9 +35,13 @@ from . import _common
 from ._common import HAS_TRITON, get_backend, reset_stats, set_backend, stats
 from ._ops import use_custom_ops   # public: force the torch.library path
 from .apply import enable, patch, revert
+from .cross_entropy import cross_entropy
+from .geglu import geglu
 from .kl import distill_kl, kl_distill_loss, kl_div, kl_div_logits
+from .layernorm import layer_norm
 from .norm import add_rms_norm, rms_norm
 from .ns import newton_schulz
+from .relu2 import relu_squared
 from .rope import qk_norm_rope
 from .softmax import softmax
 from .swiglu import swiglu, swiglu_split
@@ -41,7 +49,8 @@ from .topk import topk
 
 __all__ = [
     "HAS_TRITON", "set_backend", "get_backend", "stats", "reset_stats",
-    "rms_norm", "add_rms_norm", "qk_norm_rope", "swiglu", "swiglu_split",
+    "rms_norm", "add_rms_norm", "layer_norm", "qk_norm_rope", "swiglu", "swiglu_split",
+    "geglu", "relu_squared", "cross_entropy",
     "kl_div_logits", "kl_div", "kl_distill_loss", "distill_kl",
     "newton_schulz", "topk", "softmax",
     "enable", "patch", "revert", "available", "use_custom_ops",

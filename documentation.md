@@ -654,9 +654,17 @@ for unsupported dtypes, and — for `topk` — for `k > 512`; every fallback is 
 (`num_warps` x `num_stages`) on first GPU use; the grid is a superset of the old fixed
 heuristic, so tuning can only match or beat it, and the CPU interpreter, TileLens and
 triton-less installs never see the wrapper — `tune()` in `forgemind/kernels/_common.py`.
-The RMSNorm kernels are ported from Unsloth's `rms_layernorm.py` (Apache-2.0;
-attribution and the exact adaptations are in the `forgemind/kernels/norm.py` header);
-the fused add-RMSNorm, SwiGLU and the remaining kernels are this repo's own.
+The RMSNorm kernels are ported from Unsloth's `rms_layernorm.py`, `layer_norm` from
+Unsloth's `layernorm.py` and `geglu` from Unsloth's `geglu.py` (all Apache-2.0;
+attribution and the exact adaptations are in the `norm.py` / `layernorm.py` /
+`geglu.py` headers), and `cross_entropy` and `relu_squared` from Liger-Kernel
+(BSD-2-Clause, `linkedin/Liger-Kernel`); the fused add-RMSNorm, SwiGLU and the
+remaining kernels are this repo's own. The Liger port fixes their open compile issues
+at the root: the gradient never reuses the input logits (their #1674/#174 class),
+scalar kernel arguments are never method-called (their #1601 class), and reduction
+stays in tensor math so `fullgraph=True` holds; `tests/test_kernel_hygiene.py` bans
+both crash patterns repo-wide, and `tools/offline_compile_check.py` compiles every
+kernel offline against a fixed target so this class is caught without a GPU.
 
 ### 5.11 Checkpoint and resume
 
@@ -1055,6 +1063,12 @@ fm.kernels.kl_div(student, teacher, reduction="mean", grad_dtype=None)
 fm.kernels.newton_schulz(g, steps=5, dtype=None, fused=True)  # batched (..., m, n) -> same shape, Muon's polar step
 fm.kernels.topk(x, k, dim=-1, sorted=True) -> (values, indices)  # last dim; canonical ties, k <= 512 fused
 fm.kernels.softmax(x, dim=-1, dtype=None)                        # last dim; fused, closed-form backward
+fm.kernels.layer_norm(x, w, b=None, eps=1e-5)        # F.layer_norm(x, (d,), w, b, eps)
+fm.kernels.geglu(gate, up)                          # gelu(gate) * up (exact-erf GEGLU)
+fm.kernels.relu_squared(x)                          # relu(x) ** 2
+fm.kernels.cross_entropy(logits, targets, reduction="mean", ignore_index=-100, label_smoothing=0.0)
+#   cross_entropy is a drop-in for F.cross_entropy; logits stay untouched (the gradient
+#   goes to a separate buffer), reduction happens in tensor math so tracing stays graph-safe
 
 fm.kernels.enable(model, norm=True, swiglu_mlp=True, split=False)  # patch a whole tree in place
 fm.kernels.patch(module, split=False, kind=None) -> bool     # one module; False = not recognised
@@ -1071,10 +1085,10 @@ on the store, input mutation in the KL kernel, a non-power-of-two `tl.arange`, w
 interpreter on CPU:
 
 ```bash
-TRITON_INTERPRET=1 python tests/kernel_interp_check.py     # 66 checks, forward and backward
+TRITON_INTERPRET=1 python tests/kernel_interp_check.py     # 109 checks, forward and backward
 ```
 
-`tests/test_kernels.py` drives the same comparisons through pytest (19 tests, including
+`tests/test_kernels.py` drives the same comparisons through pytest (33 tests, including
 non-contiguous inputs, `dim=1` RMSNorm, odd `head_dim`, bf16 gradients and `V=5000` streaming).
 
 **`torch.compile` / `torch.export`.** Each kernel is registered as `torch.ops.forgemind.<name>`

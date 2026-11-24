@@ -17,8 +17,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from forgemind.kernels import _common, _fallback as fb  # noqa: E402
-from forgemind.kernels import kl, norm, rope  # noqa: E402
+from forgemind.kernels import kl, layernorm, norm, relu2, rope  # noqa: E402
 from forgemind.kernels.swiglu import _SwiGLUFn, _SwiGLUSplitFn  # noqa: E402
+
+# `geglu` and `cross_entropy` package attributes are the public FUNCTIONS (the
+# `from .geglu import geglu` rebinding shadows the submodule); grab the modules by
+# importlib so the Function classes below resolve.
+import importlib  # noqa: E402
+
+cross_entropy = importlib.import_module("forgemind.kernels.cross_entropy")
+geglu = importlib.import_module("forgemind.kernels.geglu")
 
 _common.set_backend("triton")
 torch.manual_seed(0)
@@ -140,6 +148,61 @@ for n, d, vocab, chunk in ((6, 4, 16, 4), (6, 4, 16, 100), (5, 8, 32, 2)):
     hk = hs.clone().requires_grad_(True)
     kl.kl_distill_loss(hk, ht, W, head, chunk=chunk).backward()
     check(f"grad n={n} V={vocab} chunk={chunk}", hk.grad, gexp, tol=1e-4)
+
+print("== relu_squared ==")
+for numel in (37, 4096):
+    x = torch.randn(numel)
+    grad_pair(fb.relu_squared, lambda a: relu2._ReLUSquaredFn.apply(a), x, n_grad=1)
+
+print("== geglu ==")
+for numel in (37, 4096):
+    g, u = torch.randn(numel), torch.randn(numel)
+    grad_pair(fb.geglu, lambda a, b: geglu._GEGLUFn.apply(a, b), g, u, n_grad=2)
+
+print("== layer_norm ==")
+for n, d in ((6, 8), (5, 7), (3, 16)):
+    x, w, b = torch.randn(n, d), torch.randn(d), torch.randn(d)
+    ref = lambda a, ww, bb: fb.layer_norm(a, ww, bb, 1e-5)
+    grad_pair(ref, lambda a, ww, bb: layernorm._LayerNormFn.apply(a, ww, bb, 1e-5),
+              x, w, b, n_grad=3)
+    grad_pair(lambda a, ww: fb.layer_norm(a, ww, None, 1e-5),
+              lambda a, ww: layernorm._LayerNormFn.apply(a, ww, None, 1e-5),
+              x, w, n_grad=2)
+
+print("== cross_entropy ==")
+lg = torch.randn(6, 40)
+tg = torch.randint(0, 40, (6,))
+for red in ("mean", "sum", "none"):
+    got = cross_entropy._CrossEntropyFn.apply(lg, tg, red, -100, 0.0)
+    exp = fb.cross_entropy(lg, tg, reduction=red)
+    check(f"loss {red}", got, exp)
+    d = torch.randn_like(got)
+    lk = lg.clone().requires_grad_(True)
+    cross_entropy._CrossEntropyFn.apply(lk, tg, red, -100, 0.0).backward(d)
+    lr = lg.clone().requires_grad_(True)
+    fb.cross_entropy(lr, tg, reduction=red).backward(d)
+    check(f"grad {red}", lk.grad, lr.grad)
+ign = tg.clone()
+ign[1] = -100
+for ls in (0.0, 0.1):
+    got = cross_entropy._CrossEntropyFn.apply(lg, ign, "mean", -100, ls)
+    exp = fb.cross_entropy(lg, ign, reduction="mean", label_smoothing=ls)
+    check(f"ignore+smooth ls={ls} loss", got, exp)
+    lk = lg.clone().requires_grad_(True)
+    cross_entropy._CrossEntropyFn.apply(lk, ign, "mean", -100, ls).backward()
+    lr = lg.clone().requires_grad_(True)
+    fb.cross_entropy(lr, ign, reduction="mean", label_smoothing=ls).backward()
+    check(f"ignore+smooth ls={ls} grad", lk.grad, lr.grad)
+# Liger #1674 regression: strided logits must not corrupt the gradient
+base = torch.randn(6, 80)
+strided = base[:, ::2]
+check("non-contiguous loss", cross_entropy._CrossEntropyFn.apply(strided, tg, "mean", -100, 0.0),
+      fb.cross_entropy(strided, tg))
+lk = strided.clone().requires_grad_(True)
+cross_entropy._CrossEntropyFn.apply(lk, tg, "mean", -100, 0.0).backward()
+lr = strided.clone().requires_grad_(True)
+fb.cross_entropy(lr, tg).backward()
+check("non-contiguous grad", lk.grad, lr.grad)
 
 print(f"\n{CHECKED[0]} checks, {len(FAILS)} failed")
 if FAILS:

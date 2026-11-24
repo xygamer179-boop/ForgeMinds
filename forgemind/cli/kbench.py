@@ -32,8 +32,9 @@ from ..kernels import _fallback as fb
 from ..kernels.ns import _ns_torch
 from .. import kernels
 
-DEFAULT_OPS = ["rms_norm", "add_rms_norm", "swiglu", "swiglu_split", "qk_norm_rope",
-               "kl_div_logits", "newton_schulz", "topk", "softmax"]
+DEFAULT_OPS = ["rms_norm", "add_rms_norm", "layer_norm", "swiglu", "swiglu_split",
+               "geglu", "relu_squared", "qk_norm_rope", "kl_div_logits",
+               "newton_schulz", "topk", "softmax", "cross_entropy"]
 
 
 # --------------------------------------------------------------------------- workloads
@@ -114,6 +115,24 @@ def _cases(op, tokens, dim, hidden, batch, seq, heads, head_dim, vocab, dtype):
     if op == "softmax":
         return [Case("softmax", f"[{tokens},{dim}] {dtype}",
                      lambda t, k: (kernels.softmax if k else torch.softmax)(t[0], -1))]
+
+    if op == "layer_norm":
+        return [Case("layer_norm", f"x,w,b [{tokens},{dim}] {dtype}",
+                     lambda t, k: (kernels.layer_norm if k else fb.layer_norm)(
+                         t[0], t[1], t[2], 1e-5))]
+
+    if op == "geglu":
+        return [Case("geglu", f"gate,up [{tokens},{hidden}] {dtype}",
+                     lambda t, k: (kernels.geglu if k else fb.geglu)(t[0], t[1]))]
+
+    if op == "relu_squared":
+        return [Case("relu_squared", f"[{tokens},{dim}] {dtype}",
+                     lambda t, k: (kernels.relu_squared if k else fb.relu_squared)(t[0]))]
+
+    if op == "cross_entropy":
+        return [Case("cross_entropy", f"logits [{tokens},{vocab}] {dtype}, int64 targets",
+                     lambda t, k: (kernels.cross_entropy if k else fb.cross_entropy)(
+                         t[0], t[1]))]
 
     raise ValueError(f"unknown op {op!r}, choose from {DEFAULT_OPS}")
 
@@ -321,6 +340,18 @@ def _case_tensors(case, op, a, dev, dtype):
         return [torch.randn(a.batch * 64, a.vocab, device=dev, dtype=dtype)]
     if op == "softmax":
         return [torch.randn(a.tokens, a.dim, device=dev, dtype=dtype)]
+    if op == "layer_norm":
+        return [torch.randn(a.tokens, a.dim, device=dev, dtype=dtype),
+                torch.randn(a.dim, device=dev, dtype=dtype),
+                torch.randn(a.dim, device=dev, dtype=dtype)]
+    if op == "geglu":
+        return [torch.randn(a.tokens, a.hidden, device=dev, dtype=dtype),
+                torch.randn(a.tokens, a.hidden, device=dev, dtype=dtype)]
+    if op == "relu_squared":
+        return [torch.randn(a.tokens, a.dim, device=dev, dtype=dtype)]
+    if op == "cross_entropy":
+        return [torch.randn(a.tokens, a.vocab, device=dev, dtype=dtype),
+                torch.randint(0, a.vocab, (a.tokens,), device=dev)]
     raise ValueError(op)
 
 

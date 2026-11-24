@@ -49,6 +49,31 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return (F.silu(_acc(gate)) * _acc(up)).to(gate.dtype)
 
 
+def relu_squared(x: torch.Tensor) -> torch.Tensor:
+    """``relu(x) ** 2``: same single rounding as the kernel (fp32 math, cast to x's dtype)."""
+    return (x.clamp(min=0).float() ** 2).to(x.dtype) if x.dtype != torch.float32 else x.clamp(min=0) ** 2
+
+
+def geglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """Exact-erf GEGLU: ``gelu(gate) * up`` (HF's ``GEGLU`` activation)."""
+    return (F.gelu(_acc(gate), approximate="none") * _acc(up)).to(gate.dtype)
+
+
+def layer_norm(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None,
+               eps: float = 1e-5) -> torch.Tensor:
+    """Drop-in for ``F.layer_norm(x, (d,), w, b, eps)``; fp32 math, output follows x."""
+    d = x.shape[-1]
+    return F.layer_norm(_acc(x), (d,), _acc(w), _acc(b) if b is not None else None,
+                        eps).to(x.dtype)
+
+
+def cross_entropy(logits: torch.Tensor, targets: torch.Tensor, reduction: str = "mean",
+                  ignore_index: int = -100, label_smoothing: float = 0.0) -> torch.Tensor:
+    """Drop-in for ``F.cross_entropy`` -- the oracle the Triton kernel must reproduce."""
+    return F.cross_entropy(logits, targets, reduction=reduction, ignore_index=ignore_index,
+                           label_smoothing=label_smoothing)
+
+
 def kl_div_logits(student: torch.Tensor, teacher: torch.Tensor, reduction: str = "mean"):
     """KL(teacher || student) over the last dim, plus dL/d(student logits)."""
     ls = torch.log_softmax(_acc(student), -1)
