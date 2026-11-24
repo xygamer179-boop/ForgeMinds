@@ -186,7 +186,8 @@ if triton_available():
 def _ok(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None) -> bool:
     # `numel < 2**31` keeps row offsets in int32; `<= MAX_DIM` bounds the constexpr tile.
     d = x.shape[-1] if x.dim() else 0
-    if not (w is not None and 0 < d == w.numel() <= MAX_DIM and x.numel() < 2 ** 31
+    if not (w is not None and 0 < d == w.numel() <= MAX_DIM and x.numel() > 0
+            and x.numel() < 2 ** 31
             and w.dtype == x.dtype and w.is_contiguous()
             and fast_ok(x, w)):
         return False
@@ -201,8 +202,10 @@ def _shape2(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
 
 
 def _launch_fwd(x, w, b, eps):
-    """Returns ``(Y [n,d], mu [n] fp32, r [n] fp32)`` on the 2-D layout."""
-    x2, _ = _shape2(x)
+    """Returns ``(Y (x.shape), mu [n] fp32, r [n] fp32)`` -- Y is viewed back to the
+    input's shape: a [B,T,D] activation must not come back as [B*T, D] (the fake impl
+    promises x.shape, so a mismatch corrupts a compiled graph)."""
+    x2, shape = _shape2(x)
     w = w.contiguous()
     n_rows, n_cols = x2.shape
     has_b = b is not None
@@ -213,12 +216,13 @@ def _launch_fwd(x, w, b, eps):
     block = next_pow2(n_cols)
     # no num_warps here: tune() owns launch metadata on real GPUs (see _common.tune)
     _ln_fwd[(n_rows,)](y, x2, w, b, mu, r, n_cols, n_cols, n_cols, eps, block, has_b)
-    return y, mu, r
+    return y.view(shape), mu, r
 
 
 def _launch_bwd(x, w, b, mu, r, dy, train_w: bool, train_b: bool):
-    """Returns ``(dx [n,d], dw or None, db or None)`` on the 2-D layout."""
-    x2, _ = _shape2(x)
+    """Returns ``(dx (x.shape), dw or None, db or None)`` -- dx is viewed back for the
+    same reason as the forward."""
+    x2, shape = _shape2(x)
     dy2, _ = _shape2(dy)
     w = w.contiguous()
     n_rows, n_cols = x2.shape
@@ -229,7 +233,7 @@ def _launch_bwd(x, w, b, mu, r, dy, train_w: bool, train_b: bool):
     if not (train_w or train_b):
         _ln_bwd_row_launch(dy2, dx, x2, w, b, mu, r, n_rows, n_cols, block, has_b,
                            train_w=False, train_b=False)
-        return dx, None, None
+        return dx.view(shape), None, None
     programs = nprog_for(n_rows)
     rows_per_program = max(1, _cdiv(n_rows, programs))
     programs = max(1, _cdiv(n_rows, rows_per_program))
@@ -244,7 +248,7 @@ def _launch_bwd(x, w, b, mu, r, dy, train_w: bool, train_b: bool):
     )
     dw = _sum_partials(dwp, w) if train_w else None
     db = _sum_partials(dbp, b) if (train_b and has_b) else None
-    return dx, dw, db
+    return dx.view(shape), dw, db
 
 
 def _ln_bwd_row_launch(dy2, dx, x2, w, b, mu, r, n_rows, n_cols, block, has_b,

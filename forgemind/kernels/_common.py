@@ -104,15 +104,22 @@ def fast_ok(*tensors) -> bool:
     if not triton_available():
         _note("no triton")
         return False
+    # The dtype gate applies ALWAYS: forcing the backend is documented to drop the
+    # *is_cuda* check only. Letting it drop the dtype check too put fp64 tensors into
+    # kernels that `.to(tl.float32)` their loads -- a silent precision demotion
+    # (found by the fp64 leg of the new-kernel fuzz; every kernel shares this gate).
+    for t in tensors:
+        if not isinstance(t, torch.Tensor):
+            continue
+        if t.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            _note(f"dtype {t.dtype}")
+            return False
     if _BACKEND != "triton":
         for t in tensors:
             if not isinstance(t, torch.Tensor):
                 continue
             if not (t.is_cuda or INTERPRET):
                 _note("not cuda")
-                return False
-            if t.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-                _note(f"dtype {t.dtype}")
                 return False
     if not tracing():
         _STATS["fast"] += 1
