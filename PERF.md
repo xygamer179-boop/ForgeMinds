@@ -883,3 +883,21 @@ pyflakes clean. **No GPU in this sandbox: the kbench re-measure on user hardware
 decides the round** — same command as round eight:
 
 `python -m forgemind.cli kbench --ops rms_norm,add_rms_norm,swiglu,swiglu_split,qk_norm_rope --check`
+
+### Compile policy and offload follow-up
+
+ForgeMind-managed Inductor compilation (Trainer, Forge and `kbench`) requests
+`triton.use_block_ptr=False` per compiled callable when the installed PyTorch
+supports that option, without modifying the process-wide Inductor config. Other
+compile backends keep their normal mode settings. FM's explicitly enabled Triton
+kernels use registered opaque custom ops under tracing, so Inductor compiles the
+surrounding model rather than generating the FM kernels themselves; torch fallback
+operations remain visible to Inductor. Opaque calls can also inhibit fusion, so
+this is not a speed guarantee: `fused_ops` remains opt-in and should be benchmarked
+against compiled torch on the target GPU.
+
+Offloaded Adam's chunked waits do not pipeline Adam with D2H: the update is a
+single call after all chunks are drained, and Trainer's collect/clip can drain
+copies before step. Skipping the CPU clipping multiplication when the coefficient
+is one would require an extra scalar read under the existing host-read audit; it
+is left unchanged. No GPU performance result is claimed for these changes.

@@ -11,24 +11,16 @@ reason) · **❌ rejected** (with the reason, so nobody re-litigates it).
 
 ---
 
-## 1. The critical path, before and after
+## 1. The current critical path
 
-```
-serial (before)                        pipelined (now)
-─────────────────────────────────      ─────────────────────────────────────────
-wait(all D2H)                          [chunk 0 D2H] ──► update 0
-host Adam (everything)                       [chunk 1 D2H] ──► update 1
-enqueue H2D (everything)                          [chunk 2 D2H] ──► update 2
-─────────────────────────────────      ─────────────────────────────────────────
-T = copy + update                      T ≈ max(copy, update) + copy/K
-```
-
-**✅ shipped: chunked/pipelined `OffloadedAdamW.step()`**
-(`OffloadConfig.pipeline_chunks`, default 4, `offload.py`). Gradients are grouped once at
-construction; `_offload()` records a CUDA event per chunk on the copy stream, and `step()`
-waits only for chunk *k*'s event before running Adam on chunk *k*. With the old code the host
-was idle for the entire DMA phase and the PCIe link was idle for the entire update phase; now
-the two overlap, and the tail is one chunk instead of all of them.
+`OffloadedAdamW.step()` drains any pending D2H copies, then calls host AdamW
+**once for all parameters**, then queues per-parameter H2D copies. Chunk events
+permit individual waits, but there is no per-chunk optimizer update and therefore
+no D2H/Adam pipeline. In the Trainer path `collect()` flushes after each
+micro-batch and clipping collects again before `step()`, so pending copies are
+normally already drained. D2H may overlap backward via hooks, but the final
+update remains serialized after the waits. CUDA measurements are needed to
+quantify the costs; `pipeline_chunks` does not promise a speedup.
 
 Instrumentation: `opt.report()` returns `d2h_MB`, `h2d_MB`, `syncs`, `stream_ms`,
 `host_update_ms`, `chunks`. If `host_update_ms` dominates, offload is cheap for you; if
@@ -62,8 +54,8 @@ bit-identical parameters to the serial path) and `test_chunked_step_drains_all_p
 
 | idea | verdict | why |
 |---|---|---|
-| Side stream for D2H, event per chunk, host Adam on chunk k while k+1 copies | **✅ shipped** | §1 |
-| Prefetch the H2D of chunk k+1 while Adam runs on chunk k | **✅ effectively free now** | the H2D is enqueued on the *current* stream after the last chunk, and the next step's forward kernels queue behind it, so it overlaps the next step's compute; doing it mid-`step()` would need a second host thread to be worth anything |
+| Side stream for D2H, event per chunk, host Adam on chunk k while k+1 copies | **🔜 not implemented** | events and chunk waits exist, but the single Adam step runs only after all waits (§1) |
+| Prefetch the H2D of chunk k+1 while Adam runs on chunk k | **🔜 not implemented** | H2D copies are enqueued after the full host update on the current stream; following compute waits for them |
 | Second host thread for Adam (double-buffered) | **❌** | host Adam releases the GIL only inside ATen, and the two halves would contend for the same memory bandwidth; measured wins for this pattern are ~0 outside of CPU-bound Adam on huge models |
 | Copy grads during the backward (post-accumulate hooks) | **✅ already there** | this is what turns "copy after backward" into "copy overlapping backward" |
 | Reduce-scatter straight into host memory (NCCL `ReduceScatter` with a pinned output) | **🔜** | removes a D2H pass entirely: the gradient ends up host-side as a side effect of the collective. Needs a custom comm hook + `nccl` support for host buffers; unverifiable in this sandbox (no NCCL) |
@@ -93,15 +85,16 @@ bit-identical parameters to the serial path) and `test_chunked_step_drains_all_p
 
 ## 7. What "faster offloading" actually means here
 
-On this box (CPU only) the chunked path cannot overlap anything, so the honest summary is:
-the step is now **structured** so that on a GPU the copy and the update overlap, and the
-pipeline is tested for numerical identity with the serial path. What *is* measured here is the
-cost side: `opt.report()` and `tests/test_offload.py` pin down that
+On this box (CPU only) the chunked path cannot overlap anything. On a GPU the current
+implementation still waits for all chunks before the optimizer update; tests establish
+numerical identity, not copy/update overlap. `opt.report()` and `tests/test_offload.py`
+cover the cost and correctness side:
 
 * offloaded AdamW ≡ `torch.optim.AdamW` to **0.00e+00** for `grad_accum` 1/2/3 (and now for
   `pipeline_chunks` 1/2/3/5),
 * `zero_grad()` never discards in-flight gradients,
-* the number of sync points is one per step, not one per parameter.
+* pending copies are synchronized by a flush, not individually per parameter; repeated
+  micro-batch collects can nevertheless synchronize more than once per step.
 
 The remaining roadmap items that need an accelerator to evaluate honestly are: NCCL
 reduce-scatter into pinned host memory (§4), bf16 moments (§3), and activation packing (§5).
@@ -140,7 +133,7 @@ keep weights on the device):
 
 ```
 peak(S)  = resident_weights(S) + activations + workspace + safety_margin
-time(S)  = compute + Σ bytes_moved(S) / bw          (overlap-aware: per §1, T ≈ max(compute, transfer))
+time(S)  = compute + Σ bytes_moved(S) / bw          (simplified; overlap must be measured, not assumed)
 choose S* = argmin time(S)  subject to  peak(S) ≤ budget
 ```
 
@@ -181,5 +174,5 @@ be reactive; everything else is predictive.
 **Honest status: 🔜 design only.** None of it can be validated on this box (no GPU, and
 `mem_get_info` is meaningless on CPU), so nothing here ships untested — the same rule as
 §4–§5. What the repo *does* provide as prerequisites: the one-sync step budget the
-controller must respect, `pipeline_chunks` events as the copy/overlap machinery, and
+controller must respect, `pipeline_chunks` events as copy-wait machinery, and
 `OffloadConfig` as the static policy the dynamic one would wrap rather than replace.

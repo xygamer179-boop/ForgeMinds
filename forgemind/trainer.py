@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import Dataset
 
+from ._compile import compile_options
 from .config import ForgeConfig
 from .distributed import init_distributed, DistContext, log
 from .data import build_loader, BatchStream, async_loader
@@ -165,7 +166,8 @@ class Trainer:
     def _compile_blocks(self, model, tc):
         layers = getattr(model, "layers", None)
         blocks = list(layers.values()) if hasattr(layers, "values") else list(layers or [])
-        kw = dict(mode=tc.compile_mode, fullgraph=tc.compile_fullgraph, backend=tc.compile_backend)
+        kw = dict(fullgraph=tc.compile_fullgraph, backend=tc.compile_backend,
+                  **compile_options(tc.compile_backend, tc.compile_mode))
         if not blocks:
             model.compile(**kw)
             return
