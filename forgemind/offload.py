@@ -59,7 +59,7 @@ class OffloadedAdamW:
         self._filled: set = set()     # params whose accumulator already holds a value
         self._pending: list = []      # (param, host buffer) copies still in flight
         self._pressure = 0.0
-        # pipelined step: chunk the params so the host update of chunk k overlaps the DMA of k+1
+        # Chunked event waits for staged gradient copies; host Adam still runs once afterward.
         self._chunks = max(1, int(getattr(self.cfg, "pipeline_chunks", 4)))
         self._chunk_of = {}
         self._events = None
@@ -190,12 +190,11 @@ class OffloadedAdamW:
 
     @torch.no_grad()
     def step(self):
-        """Host AdamW, chunked so the DMA of chunk k+1 overlaps the update of chunk k.
+        """Drain staged gradients, run host AdamW once, then copy masters back.
 
-        Serial version (the default before ``pipeline_chunks`` existed) is
-        ``wait-for-every-copy -> update-everything``: the host sits idle for the whole D2H
-        phase and the link sits idle for the whole update phase. With ``K`` chunks the critical
-        path is ``max(copy, update) + one chunk`` instead of ``copy + update``.
+        Chunk events allow waiting for staged copies individually, but AdamW starts
+        only after every chunk has been drained. This does not pipeline host updates
+        with D2H; collect/clip may also have flushed the copies before step begins.
         """
         import time as _t
         t0 = _t.perf_counter()

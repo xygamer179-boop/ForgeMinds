@@ -62,6 +62,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from ._compile import compile_options
 from .config import OffloadConfig, ParallelConfig
 from .data import async_loader as _async_loader
 from .data import to_device as _to_device
@@ -172,7 +173,7 @@ class Forge:
                 warn_once("[forgemind] torch.compile skipped on CPU (set FORGEMIND_COMPILE_CPU=1 "
                           "to force it)", key="forge_compile_cpu")
             else:
-                model = torch.compile(model, backend=backend, mode=compile_mode)
+                model = torch.compile(model, backend=backend, **compile_options(backend, compile_mode))
         self.raw_model = model
         self.model = self._maybe_ddp(model)
 

@@ -187,7 +187,8 @@ def _compiled(case, packed):
     """``torch.compile`` around the op, returning a callable that produces the loss."""
     def core(t):
         return _scalar(case.fn(t, packed))
-    return torch.compile(core, fullgraph=True)
+    from .._compile import compile_options
+    return torch.compile(core, fullgraph=True, **compile_options("inductor"))
 
 
 def parse(argv=None):
