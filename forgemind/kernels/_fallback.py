@@ -50,8 +50,9 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 
 def relu_squared(x: torch.Tensor) -> torch.Tensor:
-    """``relu(x) ** 2``: same single rounding as the kernel (fp32 math, cast to x's dtype)."""
-    return (x.clamp(min=0).float() ** 2).to(x.dtype) if x.dtype != torch.float32 else x.clamp(min=0) ** 2
+    """``relu(x) ** 2`` -- torch's own opmath rounding, identical to the kernel's
+    (fp32 compute for half dtypes, native dtype otherwise: no fp64 demotion)."""
+    return x.clamp(min=0) ** 2
 
 
 def geglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
@@ -69,9 +70,23 @@ def layer_norm(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None,
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor, reduction: str = "mean",
                   ignore_index: int = -100, label_smoothing: float = 0.0) -> torch.Tensor:
-    """Drop-in for ``F.cross_entropy`` -- the oracle the Triton kernel must reproduce."""
-    return F.cross_entropy(logits, targets, reduction=reduction, ignore_index=ignore_index,
-                           label_smoothing=label_smoothing)
+    """Drop-in for ``cross_entropy``'s public contract -- the oracle the Triton kernel
+    must reproduce.
+
+    The contract keeps the LAST dim as classes and flattens leading dims
+    (``[B,T,V]`` + ``[B,T]``, Liger's layout). ``F.cross_entropy`` instead takes
+    DIM 1 as classes for >2D inputs and *raises* on that pairing, so flatten first
+    and restore the targets' shape for ``reduction='none'`` -- without this the
+    fallback raised exactly where the kernel succeeded (fallback/kernel divergence
+    of the kind ``geglu``'s mirroring exists to prevent).
+    """
+    v = logits.shape[-1]
+    out = F.cross_entropy(logits.reshape(-1, v), targets.reshape(-1),
+                          reduction=reduction, ignore_index=ignore_index,
+                          label_smoothing=label_smoothing)
+    if reduction == "none":
+        return out.reshape(targets.shape)
+    return out
 
 
 def kl_div_logits(student: torch.Tensor, teacher: torch.Tensor, reduction: str = "mean"):

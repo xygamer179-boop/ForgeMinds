@@ -31,9 +31,15 @@ BANNED_METHODS = {"to", "cast", "float", "half", "int", "long", "bool"}
 
 
 def _jit_functions(tree: ast.Module) -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
-    """Every function decorated with ``triton.jit`` (bare or with arguments)."""
+    """Every function decorated with ``triton.jit``, anywhere in the file.
+
+    ``ast.walk`` matters: every kernel in this package is defined inside
+    ``if triton_available():``, so scanning only the module's top-level statements
+    finds nothing and both rules pass vacuously (that shipped bug is why this
+    helper has a regression test of its own below).
+    """
     out = []
-    for node in tree.body:
+    for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         for dec in node.decorator_list:
@@ -45,16 +51,38 @@ def _jit_functions(tree: ast.Module) -> list[tuple[str, ast.FunctionDef | ast.As
     return out
 
 
+def _module_scope_assigns(tree: ast.Module):
+    """Yield every assignment that runs at module scope, in source order.
+
+    Descends into ``if``/``try``/``with`` bodies (the ``tl.constexpr`` re-bindings
+    live there, inside ``if triton_available():``) but never into a nested scope.
+    """
+    def walk(body):
+        for node in body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                yield node
+            elif isinstance(node, ast.If):
+                yield from walk(node.body)
+                yield from walk(node.orelse)
+            elif isinstance(node, (ast.Try, ast.With, ast.For, ast.While)):
+                yield from walk(node.body)
+                yield from walk(getattr(node, "orelse", []))
+                yield from walk(getattr(node, "finalbody", []))
+                for h in getattr(node, "handlers", []):
+                    yield from walk(h.body)
+    yield from walk(tree.body)
+
+
 def _final_module_constants(tree: ast.Module) -> dict[str, object]:
-    """Names whose FINAL module-level assignment is a plain constant.
+    """Names whose FINAL module-scope assignment is a plain constant.
 
     A later ``x = tl.constexpr(x)`` re-binding (the sanctioned fix) removes the name
-    from the ban -- only an unconverted constant counts.
+    from the ban -- only an unconverted constant counts. Source order matters:
+    ``_E_BLOCK = 512`` followed by a constexpr re-bind inside ``if
+    triton_available():`` must NOT be flagged.
     """
     consts: dict[str, object] = {}
-    for node in tree.body:
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
+    for node in _module_scope_assigns(tree):
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
         value = node.value
         if not isinstance(value, ast.Constant):
@@ -70,6 +98,24 @@ def _final_module_constants(tree: ast.Module) -> dict[str, object]:
 
 def _kernel_files() -> list[pathlib.Path]:
     return sorted(p for p in KERNELS_DIR.glob("*.py") if p.name != "__init__.py")
+
+
+def test_the_scanner_finds_kernels_inside_guards():
+    """Regression for the vacuous first version: kernels are inside
+    ``if triton_available():`` (an ast.If), and a top-level-only scan sees none."""
+    # files that declare kernels must yield them; plumbing modules (_common, _ops,
+    # _fallback, apply) legitimately have none
+    for path in _kernel_files():
+        text = path.read_text()
+        if "@triton.jit" not in text:
+            continue
+        found = _jit_functions(ast.parse(text))
+        assert found, f"{path.name}: declares @triton.jit but the scanner found none -- scanner is blind"
+    # ...and the constant collector must see re-binds inside those guards, in order
+    src = "X = 5\nif True:\n    X = tl.constexpr(X)\n"
+    assert _final_module_constants(ast.parse(src)) == {}
+    src2 = "X = 5\nY = 7\n"
+    assert _final_module_constants(ast.parse(src2)) == {"X": 5, "Y": 7}
 
 
 def test_no_method_calls_on_scalar_kernel_arguments():

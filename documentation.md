@@ -1088,7 +1088,7 @@ interpreter on CPU:
 TRITON_INTERPRET=1 python tests/kernel_interp_check.py     # 109 checks, forward and backward
 ```
 
-`tests/test_kernels.py` drives the same comparisons through pytest (33 tests, including
+`tests/test_kernels.py` drives the same comparisons through pytest (38 tests, including
 non-contiguous inputs, `dim=1` RMSNorm, odd `head_dim`, bf16 gradients and `V=5000` streaming).
 
 **`torch.compile` / `torch.export`.** Each kernel is registered as `torch.ops.forgemind.<name>`

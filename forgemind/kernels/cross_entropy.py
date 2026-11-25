@@ -177,7 +177,8 @@ if triton_available():
 
 
 def _ok(logits: torch.Tensor, targets: torch.Tensor) -> bool:
-    if not (logits.dim() >= 2 and logits.shape[-1] > 0 and fast_ok(logits)):
+    if not (logits.dim() >= 2 and logits.shape[-1] > 0 and logits.numel() > 0
+            and fast_ok(logits)):
         return False
     rows = logits.numel() // logits.shape[-1]
     return targets.numel() == rows and targets.dtype == torch.int64
@@ -202,7 +203,9 @@ def _reduce(row_loss: torch.Tensor, targets: torch.Tensor, reduction: str,
             ignore_index: int, dtype: torch.dtype) -> torch.Tensor:
     """Reduction in tensor math only -- no ``.item()``, so tracing stays graph-safe."""
     if reduction == "none":
-        return row_loss.to(dtype)
+        # F returns one loss per target in the TARGETS' shape ([B,T] for [B,T,V]
+        # logits), not a flat [N] -- tests with 1-D targets hide the difference.
+        return row_loss.view(targets.shape).to(dtype)
     total = row_loss.sum()
     if reduction == "mean":
         total = total / (targets != ignore_index).sum()
@@ -316,6 +319,13 @@ def cross_entropy(logits: torch.Tensor, targets: torch.Tensor, reduction: str = 
 
     ``targets`` must hold class indices (``int64``), each in ``[0, C)`` or equal to
     ``ignore_index`` -- the same contract as torch, which device-asserts it.
+
+    Layout: the LAST dim is classes and leading dims flatten (``[B,T,V]`` logits take
+    ``[B,T]`` targets -- Liger's convention, what LLM training wants). F instead
+    takes DIM 1 as classes for >2D inputs and *rejects* that pairing, so 3-D parity
+    checks compare against the flattened 2-D call; both the kernel and the fallback
+    implement this layout (the fallback must flatten too, or it raises exactly where
+    the kernel succeeds).
     """
     _check_reduction(reduction)
     if not _ok(logits, targets):

@@ -88,6 +88,11 @@ def _cases():
     def lay(t):
         return fm.kernels.layer_norm(t[0], t[1], t[2], 1e-5)
 
+    def lay3d(t):
+        # [B,T,D]: the fake impl promises x.shape, so a flat [B*T, D] real result
+        # fails test_fake_impls_agree / the compiled-vs-eager equality here
+        return fm.kernels.layer_norm(t[0], t[1], t[2], 1e-5)
+
     def ggl(t):
         return fm.kernels.geglu(t[0], t[1])
 
@@ -101,6 +106,7 @@ def _cases():
         ("rms_norm", rms, [x, w]),
         ("add_rms_norm", addrms, [x, x.clone(), w]),
         ("layer_norm", lay, [x, ln_w, ln_b]),
+        ("layer_norm_3d", lay3d, [x.view(2, 3, 16), ln_w, ln_b]),
         ("swiglu", swig, [gate, up]),
         ("swiglu_split", swigs, [split]),
         ("geglu", ggl, [gate, up]),

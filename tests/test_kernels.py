@@ -218,6 +218,99 @@ def test_cross_entropy_non_contiguous_logits():
                           F.cross_entropy(logits, targets), atol=1e-6, rtol=1e-5)
 
 
+def test_layer_norm_multidim_input_keeps_shape():
+    """Regression: the launches returned the flat [n, d] view -- a [B,T,D] activation
+    came back as [B*T, D] (the fake impl promised x.shape, so a compiled graph would
+    disagree with reality). 2-D tests hid it because view(-1, d) is the identity there."""
+    torch.manual_seed(0)
+    x = torch.randn(2, 5, 16)
+    w, b = torch.randn(16), torch.randn(16)
+    y = kernels.layer_norm(x, w, b, 1e-5)
+    assert y.shape == x.shape
+    assert torch.allclose(y, F.layer_norm(x, (16,), w, b, 1e-5), atol=1e-6, rtol=1e-5)
+    xi, wi, bi = (t.clone().requires_grad_(True) for t in (x, w, b))
+    g = torch.randn_like(x)
+    kernels.layer_norm(xi, wi, bi, 1e-5).backward(g)
+    xr, wr, br = (t.clone().requires_grad_(True) for t in (x, w, b))
+    F.layer_norm(xr, (16,), wr, br, 1e-5).backward(g)
+    assert xi.grad.shape == x.shape
+    assert torch.allclose(xi.grad, xr.grad, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(wi.grad, wr.grad, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(bi.grad, br.grad, atol=1e-6, rtol=1e-5)
+
+
+def test_cross_entropy_none_keeps_targets_shape():
+    """Regression: reduction='none' returned a flat [N]; F returns the targets' shape
+    ([B,T] for [B,T,V] logits). 1-D-target tests hid it."""
+    torch.manual_seed(0)
+    # 2-D logits: F itself is the oracle (it keeps the targets' shape)
+    logits = torch.randn(6, 40)
+    targets = torch.randint(0, 40, (6,))
+    got = kernels.cross_entropy(logits, targets, reduction="none")
+    exp = F.cross_entropy(logits, targets, reduction="none")
+    assert got.shape == exp.shape == targets.shape
+    assert torch.allclose(got, exp, atol=1e-6, rtol=1e-5)
+    lk = logits.clone().requires_grad_(True)
+    d = torch.randn_like(got)
+    kernels.cross_entropy(lk, targets, reduction="none").backward(d)
+    lr = logits.clone().requires_grad_(True)
+    F.cross_entropy(lr, targets, reduction="none").backward(d)
+    assert lk.grad.shape == logits.shape
+    assert torch.allclose(lk.grad, lr.grad, atol=1e-6, rtol=1e-5)
+    # [B,T,V] logits + [B,T] targets: our layout flattens leading dims (Liger's --
+    # F would take DIM 1 as classes and reject this pairing), so the oracle is the
+    # flattened 2-D call. The reduction must still return targets' shape, not [N].
+    logits3 = torch.randn(2, 5, 40)
+    tg3 = torch.randint(0, 40, (2, 5))
+    got3 = kernels.cross_entropy(logits3, tg3, reduction="none")
+    exp3 = F.cross_entropy(logits3.reshape(-1, 40), tg3.reshape(-1),
+                           reduction="none").reshape(tg3.shape)
+    assert got3.shape == tg3.shape
+    assert torch.allclose(got3, exp3, atol=1e-6, rtol=1e-5)
+    lk3 = logits3.clone().requires_grad_(True)
+    d3 = torch.randn_like(got3)
+    kernels.cross_entropy(lk3, tg3, reduction="none").backward(d3)
+    lr3 = logits3.clone().requires_grad_(True)
+    F.cross_entropy(lr3.reshape(-1, 40), tg3.reshape(-1), reduction="none").reshape(
+        tg3.shape).backward(d3)
+    assert lk3.grad.shape == logits3.shape
+    assert torch.allclose(lk3.grad, lr3.grad, atol=1e-6, rtol=1e-5)
+
+
+def test_forced_backend_still_refuses_fp64():
+    """Regression: set_backend('triton') is documented to drop the *is_cuda* check
+    only; it used to drop the dtype check too, so fp64 entered kernels that demote
+    their loads to fp32 (silent precision loss). The dtype gate must always hold."""
+    torch.manual_seed(0)
+    x = torch.randn(4, 8, dtype=torch.float64)
+    w = torch.randn(8, dtype=torch.float64)
+    saved = kernels.get_backend()
+    kernels.set_backend("triton")
+    try:
+        y = kernels.relu_squared(x)
+        assert y.dtype == torch.float64
+        assert torch.equal(y, torch.relu(x) ** 2)     # exact: fallback, not a demoted kernel
+        yn = kernels.layer_norm(x, w, None, 1e-5)
+        assert yn.dtype == torch.float64
+        assert torch.allclose(yn, F.layer_norm(x, (8,), w, None, 1e-5), atol=0, rtol=1e-12)
+        assert kernels.stats()["fallback"] >= 2
+    finally:
+        kernels.set_backend(saved)
+
+
+def test_empty_inputs_fall_back_to_torch():
+    """Empty batches take the fallback (no programs would launch); F defines the answer."""
+    torch.manual_seed(0)
+    x, w = torch.randn(0, 16), torch.randn(16)
+    y = kernels.layer_norm(x, w, None, 1e-5)
+    assert y.shape == (0, 16)
+    assert torch.equal(y, F.layer_norm(x, (16,), w, None, 1e-5))
+    logits, tg = torch.randn(0, 40), torch.zeros(0, dtype=torch.int64)
+    loss = kernels.cross_entropy(logits, tg, reduction="mean")
+    exp = F.cross_entropy(logits, tg, reduction="mean")
+    assert (torch.isnan(loss) and torch.isnan(exp)) or torch.equal(loss, exp)
+
+
 def test_kl_matches_torch_kl_div():
     torch.manual_seed(0)
     s, t = torch.randn(6, 40), torch.randn(6, 40)
@@ -360,9 +453,8 @@ def test_trainer_flag_wires_the_kernels():
 # ---------------------------------------------------------------- the kernels themselves
 def test_kernels_in_triton_interpreter():
     """Run every kernel on CPU through `TRITON_INTERPRET=1` and compare to torch."""
-    try:
-        import triton  # noqa: F401
-    except Exception:
+    import importlib.util
+    if importlib.util.find_spec("triton") is None:
         pytest.skip("triton is not installed")
     env = dict(os.environ, TRITON_INTERPRET="1", PYTHONPATH=ROOT)
     env.pop("CUDA_VISIBLE_DEVICES", None)
