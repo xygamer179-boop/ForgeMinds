@@ -312,3 +312,22 @@ GPU speed claims remain deferred to the user's hardware: re-run
 `kbench --ops rms_norm,add_rms_norm,swiglu,swiglu_split,qk_norm_rope --check` for the
 "after" table (the qk row's 9.71× vs eager stands; its `nan` inductor cell now carries a
 corrected attribution in `PERF.md` §13).
+
+## Follow-up: kernel correctness and VRAM measurement
+
+The earlier remediation counts above are historical, not the current suite totals.
+A later check fixed the cross-entropy custom-op fake implementation for
+multidimensional `reduction="none"` to match `targets.shape`, with an interpreter
+fullgraph forward/backward regression test. Eager LayerNorm inference now omits two
+fp32 per-row backward-statistic buffers, a logical `8 × rows` byte reduction per
+call; training and the custom-op/compiled path are unchanged. This is not a
+measured whole-model VRAM reduction.
+
+`kbench --memory --no-compile` now reports isolated CUDA incremental peak
+allocated bytes against eager torch, not Inductor. `bench --fused-ops` permits a
+separate-process whole-model comparison against the unpatched default; subtract
+`peak_mem_bytes` values for actual savings. See [PERF.md](PERF.md#vram-measuring-kernel-and-whole-model-impact)
+for scope, commands and limitations. The comparison has not been run on a GPU here.
+On the CPU/interpreter validation run preceding the final benchmark harness test,
+pytest reported 252 passed / 36 skipped and 287 passed / 1 skipped respectively;
+offline compilation passed 14/14 and interpreter kernel checks passed 109/109.

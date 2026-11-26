@@ -58,6 +58,7 @@ def parse(argv=None):
     r.add_argument("--profile", default=None, metavar="DIR", help="record torch.profiler trace to DIR (TensorBoard/Perfetto)")
     r.add_argument("--profile-top", type=int, default=15, help="print the N most expensive ops (with --profile)")
     r.add_argument("--compile", action="store_true", help="torch.compile the transformer blocks")
+    r.add_argument("--fused-ops", action="store_true", help="enable ForgeMind's supported model kernel patches")
     r.add_argument("--no-prefetch", action="store_true", help="disable the overlapped host->device batch copy")
     r.add_argument("--syncs", action="store_true",
                    help="count host<->device synchronisations per step (the stall budget)")
@@ -79,7 +80,7 @@ def build_config(a) -> ForgeConfig:
     cfg.offload.optimizer, cfg.offload.activations, cfg.offload.experts = a.offload_opt, a.offload_act, a.offload_experts
     cfg.train.__dict__.update(max_steps=a.warmup + a.steps, warmup_steps=0, log_every=10**9,
                               ac=a.ac, ckpt_every=0, eval_every=0, resume=False, grad_clip=1.0,
-                              compile=a.compile, prefetch=not a.no_prefetch)
+                              compile=a.compile, fused_ops=a.fused_ops, prefetch=not a.no_prefetch)
     return cfg
 
 
@@ -97,9 +98,6 @@ def main(argv=None):
     tr = Trainer(lambda ctx: GPT(mc, moe_kwargs(ctx, cfg) if a.moe else None), cfg, ds,
                  micro_batch=a.micro_batch, peak_flops=a.peak_tflops * 1e12 or None)
     ctx = tr.ctx
-    if ctx.device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-
     # Resolve backend up front so the report states what actually ran (fails loudly if forced backend is missing).
     resolved = resolve_backend(cfg.quant) if a.quant != "none" else "none"
 
@@ -114,6 +112,9 @@ def main(argv=None):
         prof.__enter__()
     sync_cm = sync_counter = None
     for i in range(a.warmup + a.steps):
+        if i == a.warmup and ctx.device.type == "cuda":
+            torch.cuda.synchronize(ctx.device)
+            torch.cuda.reset_peak_memory_stats(ctx.device)
         if i == a.warmup and a.syncs:
             from ..perf import count_host_syncs
             sync_cm = count_host_syncs(capture_stack=False, count_cpu=ctx.device.type != "cuda")
@@ -147,7 +148,7 @@ def main(argv=None):
         "quant_mode": a.quant, "quant_requested": a.qbackend, "quant_resolved": resolved,
         "parallel": {"dp_replicate": a.dp_replicate, "dp_shard": a.dp_shard, "tp": a.tp, "pp": a.pp, "ep": a.ep},
         "offload": {"opt": a.offload_opt, "act": a.offload_act, "experts": a.offload_experts},
-        "ac": a.ac, "backend": a.backend,
+        "ac": a.ac, "backend": a.backend, "fused_ops": a.fused_ops, "compile": a.compile,
         "params_M": round(sum(p.numel() for p in tr.raw.parameters()) / 1e6, 2),
         "step_ms_p50": round(med * 1000, 2),
         "step_ms_p90": round(pct(times, 0.9) * 1000, 2),
@@ -155,7 +156,8 @@ def main(argv=None):
         "loss_last": round(losses[-1], 4),
     }
     if ctx.device.type == "cuda":
-        res["peak_mem_gb"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
+        res["peak_mem_bytes"] = torch.cuda.max_memory_allocated(ctx.device)
+        res["peak_mem_gb"] = round(res["peak_mem_bytes"] / 2**30, 2)
     if a.syncs:
         # "own" = synchronisations issued by forgemind; "external" = torch internals (e.g. AdamW's
         # bias-correction reads a CPU-hosted step counter, which is free, and never fires with fused=True).

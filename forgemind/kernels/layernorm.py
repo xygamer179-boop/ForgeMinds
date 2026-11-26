@@ -73,6 +73,7 @@ if triton_available():
         eps: tl.constexpr,        # norm epsilon, per model
         BLOCK: tl.constexpr,      # n_cols rounded to a power of two
         HAS_B: tl.constexpr,      # bias present
+        SAVE_STATS: tl.constexpr, # inference needs neither backward statistic
     ):
         row = tl.program_id(0)
         cols = tl.arange(0, BLOCK)
@@ -86,8 +87,9 @@ if triton_available():
         # `tl.full`, not `eps.to(tl.float32)`: under torch.compile a scalar argument
         # arrives as a plain Python float (Liger #1601) and has no `.to`.
         rstd = tl.math.rsqrt(var + tl.full((), eps, tl.float32))
-        tl.store(Mu + row, mean)
-        tl.store(R + row, rstd)
+        if SAVE_STATS:
+            tl.store(Mu + row, mean)
+            tl.store(R + row, rstd)
 
         y = xc * rstd
         w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
@@ -201,7 +203,7 @@ def _shape2(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
     return x.contiguous().view(-1, d), tuple(x.shape)
 
 
-def _launch_fwd(x, w, b, eps):
+def _launch_fwd(x, w, b, eps, save_stats=True):
     """Returns ``(Y (x.shape), mu [n] fp32, r [n] fp32)`` -- Y is viewed back to the
     input's shape: a [B,T,D] activation must not come back as [B*T, D] (the fake impl
     promises x.shape, so a mismatch corrupts a compiled graph)."""
@@ -211,11 +213,13 @@ def _launch_fwd(x, w, b, eps):
     has_b = b is not None
     b = b.contiguous() if has_b else w          # placeholder pointer; never read (HAS_B=0)
     y = torch.empty((n_rows, n_cols), dtype=x.dtype, device=x.device)
-    mu = torch.empty(n_rows, dtype=torch.float32, device=x.device)
-    r = torch.empty(n_rows, dtype=torch.float32, device=x.device)
+    mu = torch.empty(n_rows, dtype=torch.float32, device=x.device) if save_stats else None
+    r = torch.empty(n_rows, dtype=torch.float32, device=x.device) if save_stats else None
     block = next_pow2(n_cols)
     # no num_warps here: tune() owns launch metadata on real GPUs (see _common.tune)
-    _ln_fwd[(n_rows,)](y, x2, w, b, mu, r, n_cols, n_cols, n_cols, eps, block, has_b)
+    # Valid placeholders are never accessed when SAVE_STATS is false.
+    _ln_fwd[(n_rows,)](y, x2, w, b, mu if save_stats else y, r if save_stats else y,
+                       n_cols, n_cols, n_cols, eps, block, has_b, save_stats)
     return y.view(shape), mu, r
 
 
@@ -344,4 +348,6 @@ def layer_norm(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None,
         return fb.layer_norm(x, w, b, eps)
     if _LN_OP is not None and _ops.wanted():
         return _LN_OP(x, w, b, eps)[0]
+    if not torch.is_grad_enabled() or not any(t.requires_grad for t in (x, w, b) if t is not None):
+        return _launch_fwd(x, w, b, eps, save_stats=False)[0]
     return _LayerNormFn.apply(x, w, b, eps)

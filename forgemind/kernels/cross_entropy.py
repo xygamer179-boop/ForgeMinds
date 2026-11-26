@@ -265,7 +265,7 @@ class _CrossEntropyFn(torch.autograd.Function):
 def _ce_fake(logits: torch.Tensor, targets: torch.Tensor, reduction: str,
              ignore_index: int, label_smoothing: float) -> torch.Tensor:
     if reduction == "none":
-        return torch.zeros(targets.numel(), dtype=logits.dtype, device=logits.device)
+        return torch.empty(targets.shape, dtype=logits.dtype, device=logits.device)
     return torch.zeros((), dtype=logits.dtype, device=logits.device)
 
 
