@@ -223,3 +223,24 @@ def test_custom_ops_are_not_used_when_the_kernels_cannot_run():
         assert fm.kernels.stats()["fallback"] >= 1
     finally:
         _common.set_backend(saved)
+
+
+@needs_ops
+@needs_kernels
+def test_cross_entropy_multidimensional_none_fake_and_compile():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    x = torch.randn(2, 3, 16, requires_grad=True)
+    target = torch.randint(0, 16, (2, 3))
+    _ops.use_custom_ops(True)
+    with FakeTensorMode() as mode:
+        xf, tf = mode.from_tensor(x), mode.from_tensor(target)
+        assert fm.kernels.cross_entropy(xf, tf, reduction="none").shape == target.shape
+    compiled = torch.compile(lambda a, b: fm.kernels.cross_entropy(a, b, reduction="none"),
+                             backend="aot_eager", fullgraph=True)
+    result = compiled(x, target)
+    assert result.shape == target.shape
+    reference = torch.nn.functional.cross_entropy(x.reshape(-1, 16), target.reshape(-1),
+                                                   reduction="none").reshape(target.shape)
+    torch.testing.assert_close(result, reference)
+    torch.testing.assert_close(torch.autograd.grad(result.sum(), x)[0],
+                               torch.autograd.grad(reference.sum(), x)[0])

@@ -529,3 +529,33 @@ def test_rms_norm_nondefault_eps_backwards_match_torch():
         out_b.sum().backward()
         assert torch.allclose(a.grad, b.grad, atol=1e-4, rtol=1e-4), eps
         assert torch.allclose(wa.grad, wb.grad, atol=1e-4, rtol=1e-4), eps
+
+
+def test_layernorm_inference_avoids_saved_statistics(monkeypatch):
+    import importlib
+    ln = importlib.import_module("forgemind.kernels.layernorm")
+    common = importlib.import_module("forgemind.kernels._common")
+    if not (common.INTERPRET or torch.cuda.is_available()):
+        pytest.skip("requires the Triton interpreter or CUDA")
+    device = "cpu" if common.INTERPRET else "cuda"
+    x = torch.randn(7, 16, device=device)
+    w = torch.randn(16, device=device)
+    b = torch.randn(16, device=device)
+    calls = []
+    real = ln._launch_fwd
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs.get("save_stats", True))
+        result = real(*args, **kwargs)
+        if not calls[-1]:
+            assert result[1:] == (None, None)
+        return result
+
+    monkeypatch.setattr(ln, "_launch_fwd", spy)
+    with torch.no_grad():
+        actual = ln.layer_norm(x, w, b)
+    torch.testing.assert_close(actual, torch.nn.functional.layer_norm(x, (16,), w, b))
+    assert calls == [False]
+    calls.clear()
+    ln.layer_norm(x.requires_grad_(), w, b).sum().backward()
+    assert calls == [True]

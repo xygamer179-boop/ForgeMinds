@@ -251,7 +251,15 @@ is traced (one aten node, `fullgraph=True` holds), while eager still takes the T
 
 ```bash
 python -m forgemind.cli kbench --check   # per-op A/B/C vs inductor on your GPU; exit 3 if we lose
+python -m forgemind.cli kbench --memory --no-compile --ops layer_norm,swiglu --json kernel-memory.json
 ```
+
+`--memory` reports CUDA peak **allocated** bytes above the live inputs for each eager
+operator and FM wrapper (forward and backward by default), after warmup. Wrappers can
+fall back to torch, and individual operator peaks cannot be summed to get a model peak.
+Eager LayerNorm inference avoids two fp32 per-row backward-statistic buffers: `8 × rows`
+bytes of logical allocation per invocation (64 KiB for 8,192 rows); this is not a
+measured whole-model or training saving. See [PERF.md](PERF.md#vram-measuring-kernel-and-whole-model-impact).
 
 ## Muon optimizer
 
@@ -299,8 +307,17 @@ the full audit (every stall site, every graph break, every bug, with measurement
 python -m forgemind.cli.bench --syncs --moe --experts 8        # tokens/s, p50/p90, MFU, host syncs/step
 python -m forgemind.cli.bench --compile --quant fp8 --qbackend auto
 python -m forgemind.cli.bench --profile /tmp/trace             # top ops + Perfetto/TensorBoard trace
+python -m forgemind.cli.bench --preset tiny --json torch.json
+python -m forgemind.cli.bench --preset tiny --fused-ops --json fused.json
 python -m forgemind.cli.matrix --quant none fp8 --backends auto te   # comparison table
 ```
+
+For whole-model CUDA VRAM savings, subtract `fused.json`'s `peak_mem_bytes` from
+`torch.json`'s value (and divide by the latter for the percentage). Use identical
+settings and separate processes; add `--compile` to both to compare compiled runs.
+The peak is allocated memory on rank 0 during measured steps after warmup, not
+reserved memory or the sum across ranks. `--fused-ops` only patches supported model
+modules; no GPU VRAM saving has been measured in this environment.
 
 ```python
 from forgemind.perf import count_host_syncs, host_syncs
@@ -319,7 +336,7 @@ print(trainer.feed.report())       # batch pipeline: wait_ms_per_batch, stalled,
 | `TrainConfig.prefetch` / `workers` | `True` / `0` | overlap the next batch's H2D copy on a side stream; `workers>0` adds a DataLoader pool |
 | `TrainConfig.batch_thread` / `prefetch_depth` | auto (workers==0 or CUDA) / 2 | run the **loader** on a background thread so batch *k+1* is assembled (and copied) while step *k* computes; `False` restores bit-exact serial order |
 | `OffloadConfig.optimizer` / `smart` / `gpu_watermark` | off / on / 0 | fp32 master + Adam states in pinned host RAM, grads streamed on a side stream |
-| `OffloadConfig.pipeline_chunks` | 4 | overlap the grad DMA of chunk *k+1* with the host Adam update of chunk *k*; `opt.report()` shows the split (see [OFFLOAD.md](OFFLOAD.md)) |
+| `OffloadConfig.pipeline_chunks` | 4 | chunked gradient-copy waits; host Adam starts after all chunks drain, not pipelined with D2H (see [OFFLOAD.md](OFFLOAD.md)) |
 | `OffloadConfig.activations` / `act_pool` | off / on | spill large saved activations to pinned host memory, recycling buffers |
 | `OffloadConfig.experts` | off | keep MoE experts in pinned host RAM, stream only the active ones |
 | `GPTConfig.expert_grouped_mm` | `True` | `torch._grouped_mm` expert GEMMs (CUDA+bf16): removes the last host read from the MoE dispatch |
@@ -361,7 +378,7 @@ The rest (quantization backends, offload+PP, empty `evaluate()`, OOM tuning) is 
 ## Status
 
 Verified on CPU/gloo (see `tests/`, 218 tests): dense/MoE training, grad accumulation, checkpoint+resume,
-offload optimizer equivalence (and the chunked/pipelined path), AC modes, DDP/FSDP2/HSDP/TP/PP/3D, EP
+offload optimizer equivalence (including chunked waits), AC modes, DDP/FSDP2/HSDP/TP/PP/3D, EP
 equivalence, `torch.compile` (`aot_eager`) with `fullgraph=True` and eager-gradient equivalence, the
 packed Triton kernels run through Triton's CPU interpreter (forward *and* backward vs torch) **and**
 through TileLens (formerly Triton-Viz): symbolic memory sanitizer, race detector and profiler across
@@ -371,7 +388,7 @@ DDP launch covering `fm.all_gather` and rank-0 save/load), `fm.Muon` (reference 
 a 2-process DDP check), autotuning, the asynchronous batch pipeline (order,
 overlap, rank alignment, resume, thread/worker cleanup), and a one-host-sync-per-step budget.
 
-Untested here (no accelerator): CUDA offload streams and the pipelined overlap they enable, async H2D
+Untested here (no accelerator): CUDA offload streams and any copy/backward overlap, async H2D
 overlap and pinned-buffer reuse in the batch pipeline, kernel launches on real hardware (correctness is
 verified through the interpreter, *speed* is not), fused kernels under `torch.compile` on CUDA,
 `torch._grouped_mm` dispatch, TE/torchao FP8/INT8 training, DeepSpeed engine, NCCL.

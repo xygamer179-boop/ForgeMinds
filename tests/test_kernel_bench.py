@@ -47,3 +47,26 @@ def test_kbench_is_reachable_as_a_subcommand():
                        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     assert r.returncode == 0, r.stderr[-500:]
     assert "--tolerance" in r.stdout
+
+
+def test_memory_refuses_cpu(capsys):
+    assert kbench.main(["--device", "cpu", "--memory", *TINY]) == 2
+    assert "requires CUDA" in capsys.readouterr().out
+
+
+def test_training_bench_fused_flag():
+    from forgemind.cli.bench import parse, build_config
+    assert build_config(parse([])).train.fused_ops is False
+    assert build_config(parse(["--fused-ops"])).train.fused_ops is True
+
+
+def test_memory_peak_uses_post_warmup_baseline(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: calls.append("sync"))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 100)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: calls.append("reset"))
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 180)
+    case = kbench.Case("identity", "", lambda inputs, packed: inputs[0] * 2, backward=True)
+    assert kbench._memory_peak(case, [torch.ones(4)], True, torch.device("cpu")) == 80
+    assert calls.count("reset") == 1
+    assert calls == ["sync", "sync", "reset", "sync"]

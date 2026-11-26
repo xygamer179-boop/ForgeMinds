@@ -901,3 +901,39 @@ single call after all chunks are drained, and Trainer's collect/clip can drain
 copies before step. Skipping the CPU clipping multiplication when the coefficient
 is one would require an extra scalar read under the existing host-read audit; it
 is left unchanged. No GPU performance result is claimed for these changes.
+
+### VRAM: measuring kernel and whole-model impact
+
+Eager LayerNorm inference now skips its two fp32 per-row saved-statistic buffers:
+**8 × rows bytes** of logical allocations per invocation. For 8,192 rows this is
+65,536 bytes (0.0625 MiB), not a claim about peak allocated/reserved VRAM or a
+training saving. The compiled/custom-op path and training still use the stats.
+
+Measure isolated ops on the target CUDA device, including backward by default:
+
+```
+python -m forgemind.cli kbench --memory --no-compile --ops layer_norm,swiglu --json kernel-memory.json
+```
+
+`memory` records eager and FM incremental peak **allocated** bytes above identical
+live input tensors, after warmup, and their signed difference. A negative saving
+means the FM path used more. This does not measure reserved memory or another
+process's allocations, and a given FM wrapper can fall back to torch for unsupported
+shapes/dtypes. Isolated op peaks must **not** be summed: overlapping lifetimes,
+weights, optimizer state, activation checkpointing and compilation determine the
+actual model peak. The per-op comparison is eager torch, not Inductor.
+
+For a whole-model comparison use separate processes and identical settings:
+
+```
+python -m forgemind.cli bench --preset tiny --seq 512 --json torch.json
+python -m forgemind.cli bench --preset tiny --seq 512 --fused-ops --json fused.json
+```
+
+Subtract `fused.json`'s `peak_mem_bytes` from `torch.json`'s value; divide by the
+latter for the percentage. `peak_mem_bytes` is CUDA peak allocated memory for the
+measured training steps after warmup on rank 0, including live model and optimizer
+allocations; it is not reserved memory or a sum across distributed ranks. Add
+`--compile` to both runs to compare inductor configurations. Only modules patched
+by `fused_ops` are included; this is not every standalone FM kernel. Results depend
+on hardware, shapes and configuration; no GPU savings have been measured here.

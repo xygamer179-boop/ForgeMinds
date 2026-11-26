@@ -176,3 +176,20 @@ be reactive; everything else is predictive.
 §4–§5. What the repo *does* provide as prerequisites: the one-sync step budget the
 controller must respect, `pipeline_chunks` events as copy-wait machinery, and
 `OffloadConfig` as the static policy the dynamic one would wrap rather than replace.
+
+## 9. Measuring VRAM alongside offload
+
+For CUDA whole-training-step peak **allocated** memory, run the same workload in
+separate processes with `python -m forgemind.cli bench --preset tiny --json torch.json`
+and then with `--fused-ops --json fused.json`. Both runs should use identical
+`--offload-opt`, `--offload-act`, `--ac`, `--compile` and other settings when
+comparing kernel patches; to compare an offload option, change only that option.
+Subtract the second `peak_mem_bytes` from the first, then divide by the first for
+the percentage. The field is rank-0 peak allocated memory during measured steps
+after warmup—not reserved VRAM, host RAM, or a sum across ranks. It includes
+live model/optimizer allocations. Kernel savings and offload savings cannot be
+added independently because their tensor lifetimes can overlap.
+
+`kbench --memory --no-compile` separately measures isolated eager operators, not
+whole-model or offload peaks. CUDA is required for both actual VRAM comparisons;
+no result has been measured on a GPU in this environment. See [PERF.md](PERF.md#vram-measuring-kernel-and-whole-model-impact).

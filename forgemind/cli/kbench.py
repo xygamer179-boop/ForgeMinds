@@ -183,6 +183,37 @@ def _bench(case, tensors, packed, measure, iters, warmup):
     return measure(fn, iters, warmup)
 
 
+def _memory_peak(case, tensors, packed, device):
+    """Peak allocated bytes above live inputs, for one eager op and its backward.
+
+    Inputs are cloned before resetting the peak so both paths have the same base.
+    A warmup excludes compilation/autotuning; allocator reservations, other processes,
+    model weights and optimizer state are not counted. Independent op peaks cannot
+    be summed to obtain a model peak.
+    """
+    def run(ins):
+        out = case.fn(ins, packed)
+        if case.backward:
+            _scalar(out).backward()
+        return out
+
+    ins = [t.detach().clone().requires_grad_(t.is_floating_point() and case.backward)
+           for t in tensors]
+    out = run(ins)
+    torch.cuda.synchronize(device)
+    del out
+    for t in ins:
+        t.grad = None
+    torch.cuda.synchronize(device)
+    base = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    out = run(ins)
+    torch.cuda.synchronize(device)
+    peak = torch.cuda.max_memory_allocated(device) - base
+    del out, ins
+    return peak
+
+
 def _compiled(case, packed):
     """``torch.compile`` around the op, returning a callable that produces the loss."""
     def core(t):
@@ -220,6 +251,8 @@ def parse(argv=None):
                    help="run the check on CPU, where kernels fall back and numbers are moot")
     p.add_argument("--no-compile", action="store_true",
                    help="skip the torch.compile columns (fast smoke run, no C++ toolchain)")
+    p.add_argument("--memory", action="store_true",
+                   help="measure per-op incremental CUDA peak allocated bytes (eager vs kernel)")
     p.add_argument("--json", default=None, help="write the raw measurements here")
     return p.parse_args(argv)
 
@@ -229,6 +262,9 @@ def main(argv=None):
     dev = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dtype = getattr(torch, a.dtype)
     cpu = dev.type != "cuda"
+    if a.memory and (cpu or not torch.cuda.is_available()):
+        print("[kbench] --memory requires CUDA; CPU fallback cannot measure GPU VRAM savings.")
+        return 2
     if cpu and a.check and not a.allow_cpu:
         print("[kbench] refusing --check on CPU: without CUDA the kernels fall back to torch, so "
               "every column measures the same expression. Re-run on the target GPU (or pass "
@@ -275,8 +311,23 @@ def main(argv=None):
                 except Exception as exc:  # pragma: no cover - custom-op compile issues
                     print(f"  ({case.name}: compiled-kernel compile failed: "
                           f"{type(exc).__name__}: {str(exc)[:120]})")
-            rows.append(dict(op=case.name, shapes=case.shapes, eager=ms_eager, inductor=ms_ind,
-                             kernel=ms_kernel, kernel_compiled=ms_kernel_c))
+            row = dict(op=case.name, shapes=case.shapes, eager=ms_eager, inductor=ms_ind,
+                       kernel=ms_kernel, kernel_compiled=ms_kernel_c)
+            if a.memory and tensors is not None:
+                try:
+                    eager_peak = _memory_peak(case, tensors, False, dev)
+                    kernel_peak = _memory_peak(case, tensors, True, dev)
+                    row["memory"] = dict(eager_peak_extra_bytes=eager_peak,
+                                         kernel_peak_extra_bytes=kernel_peak,
+                                         saved_bytes=eager_peak - kernel_peak)
+                    print(f"    incremental peak: torch {eager_peak / 2**20:.2f} MiB, "
+                          f"FM {kernel_peak / 2**20:.2f} MiB, "
+                          f"difference {(eager_peak - kernel_peak) / 2**20:+.2f} MiB "
+                          "(per-op, not additive)")
+                except Exception as exc:
+                    failed.append((case.name, f"memory: {type(exc).__name__}: {str(exc)[:200]}"))
+                    print(f"  ({case.name}: MEMORY FAILED -- {type(exc).__name__}: {str(exc)[:160]})")
+            rows.append(row)
             base = {"eager": ms_eager, "inductor": ms_ind,
                     "best": _nanmin(ms_eager, ms_ind)}[a.baseline]
             speed = base / ms_kernel if ms_kernel else float("inf")
@@ -295,6 +346,8 @@ def main(argv=None):
             json.dump(rows, fh, indent=2)
         print(f"[kbench] wrote {a.json}")
 
+    if a.memory and failed and not a.check:
+        return 3
     if a.check:
         if failed:
             for name, err in failed:

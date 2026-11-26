@@ -543,7 +543,7 @@ cfg.train.ac = "full"              # "none" | "full" | "selective"
 cfg.train.ac_preserve_rng = False  # True only if the model has dropout inside checkpointed blocks
 
 cfg.offload.optimizer = True       # fp32 master weights + Adam moments in pinned host RAM
-cfg.offload.pipeline_chunks = 4    # overlap grad D2H of chunk k+1 with the host Adam of chunk k
+cfg.offload.pipeline_chunks = 4    # chunked gradient-copy waits; Adam starts after all waits
 cfg.offload.activations = True     # spill large saved activations to pinned host RAM
 cfg.offload.act_layers = 0.5       # only the first half of the blocks
 cfg.offload.experts = True         # stream only the *active* experts for MoE
@@ -711,6 +711,20 @@ python -m forgemind.cli.bench --compile --quant fp8 --qbackend auto
 python -m forgemind.cli.bench --profile /tmp/trace             # top ops + Perfetto/TensorBoard trace
 python -m forgemind.cli.matrix --quant none fp8 --backends auto te   # comparison table
 ```
+
+For total CUDA training peak with and without supported FM patches, use separate processes:
+
+```bash
+python -m forgemind.cli bench --preset tiny --seq 512 --json torch.json
+python -m forgemind.cli bench --preset tiny --seq 512 --fused-ops --json fused.json
+```
+
+Subtract `fused.json`'s `peak_mem_bytes` from `torch.json`'s; divide by the latter
+for a percentage. Use identical settings; add `--compile` to both runs for a compiled
+comparison. This is rank-0 CUDA peak **allocated** memory during measured steps after
+warmup, including live model and optimizer allocations—not reserved VRAM or a sum
+across ranks. `--fused-ops` only patches supported model modules. This environment
+has no CUDA measurement, so no total saving is claimed.
 
 In-process:
 
@@ -998,7 +1012,7 @@ cpu_offload=False, reshard=True)`, `expert_params(model)`, `sync_expert_grads(mo
 | `act_min_bytes` | `1048576` | size threshold for activation spilling |
 | `act_layers` | `1.0` | fraction of blocks (from the front) whose activations are offloaded |
 | `act_pool` | `True` | recycle pinned buffers instead of allocating per saved tensor |
-| `pipeline_chunks` | `4` | overlap grad D2H of chunk *k+1* with the host Adam update of chunk *k* |
+| `pipeline_chunks` | `4` | chunked gradient-copy waits; host Adam runs after all chunks drain |
 | `experts` | `False` | keep MoE expert weights in host RAM, stream only the active ones |
 
 ### 7.4 `TrainConfig`
@@ -1067,8 +1081,9 @@ fm.kernels.layer_norm(x, w, b=None, eps=1e-5)        # F.layer_norm(x, (d,), w, 
 fm.kernels.geglu(gate, up)                          # gelu(gate) * up (exact-erf GEGLU)
 fm.kernels.relu_squared(x)                          # relu(x) ** 2
 fm.kernels.cross_entropy(logits, targets, reduction="mean", ignore_index=-100, label_smoothing=0.0)
-#   cross_entropy is a drop-in for F.cross_entropy; logits stay untouched (the gradient
-#   goes to a separate buffer), reduction happens in tensor math so tracing stays graph-safe
+#   classes are the LAST logits dimension, with targets shaped as the leading dimensions.
+#   For >2-D logits this differs from F.cross_entropy's dim-1 convention; compare to a
+#   flattened 2-D F call. Logits stay untouched and the gradient uses a separate buffer.
 
 fm.kernels.enable(model, norm=True, swiglu_mlp=True, split=False)  # patch a whole tree in place
 fm.kernels.patch(module, split=False, kind=None) -> bool     # one module; False = not recognised
@@ -1088,8 +1103,13 @@ interpreter on CPU:
 TRITON_INTERPRET=1 python tests/kernel_interp_check.py     # 109 checks, forward and backward
 ```
 
-`tests/test_kernels.py` drives the same comparisons through pytest (38 tests, including
+`tests/test_kernels.py` drives the same comparisons through pytest (39 tests, including
 non-contiguous inputs, `dim=1` RMSNorm, odd `head_dim`, bf16 gradients and `V=5000` streaming).
+Eager LayerNorm inference without gradients omits two fp32 row-statistic buffers, saving
+`8 × rows` bytes of logical allocation per invocation (64 KiB for 8,192 rows). Training
+and the compiled/custom-op path still allocate them; this is not a model peak measurement.
+Cross-entropy's fake implementation preserves `targets.shape` for `reduction="none"`,
+matching the actual output, including multidimensional targets.
 
 **`torch.compile` / `torch.export`.** Each kernel is registered as `torch.ops.forgemind.<name>`
 (fake implementation + registered backward) and is used whenever `torch.compile` traces, so:
@@ -1133,7 +1153,15 @@ Speed is a separate question, and it is answered per op against the thing it has
 python -m forgemind.cli kbench                       # eager vs inductor vs kernel, fwd+bwd
 python -m forgemind.cli kbench --ops rms_norm --mode fwd
 python -m forgemind.cli kbench --check --tolerance 0 # exit 3 if any kernel loses to inductor
+python -m forgemind.cli kbench --memory --no-compile --ops layer_norm,swiglu --json kernel-memory.json
 ```
+
+`--memory` requires CUDA. For each op it reports warmup-excluded incremental peak
+allocated bytes for eager torch and the FM wrapper, plus their signed difference;
+inputs are already live at the baseline and backward is included by default. A wrapper
+may fall back to torch. These are eager per-op measurements, not comparisons with
+Inductor or reserved memory, and cannot be added to calculate whole-model VRAM. Use
+the whole-model procedure in §5.13 for that.
 
 `--check` is a gate, not a report: it fails the run when a kernel is slower than the baseline, so
 "no GPU speed decrease" is a command rather than a claim. (It refuses to run on CPU, where the
@@ -1153,7 +1181,7 @@ kernels fall back and every column measures the same expression.)
 | `--dp-replicate`, `--dp-shard`, `--tp`, `--pp`, `--ep`, `--backend {native,deepspeed}`, `--zero` | layout |
 | `--offload-opt`, `--offload-act`, `--offload-experts`, `--ac {none,full,selective}` | memory |
 | `--warmup`, `--steps`, `--peak-tflops` | run shape (MFU needs peak TFLOPS) |
-| `--compile`, `--no-prefetch`, `--syncs` | speed / auditing |
+| `--compile`, `--fused-ops`, `--no-prefetch`, `--syncs` | compile, opt-in supported kernel patches, and auditing |
 | `--json FILE`, `--profile DIR`, `--profile-top N` | machine-readable output, profiler trace |
 
 ### `python -m forgemind.cli.matrix`
@@ -1212,7 +1240,7 @@ Verified on CPU/gloo in this repository (`pytest tests/`, 218 tests — and 236 
 `TRITON_INTERPRET=1`, where the real kernels run inside the test suite too):
 
 * dense and MoE training, gradient accumulation, checkpoint + resume;
-* `OffloadedAdamW` equivalence including the chunked/pipelined path, activation offload;
+* `OffloadedAdamW` equivalence including chunked waits, activation offload;
 * AC modes (`full`, `selective`, RNG preservation);
 * DDP / FSDP2 / HSDP / TP / PP / 3D and EP equivalence (`mp_check.py`, up to 8 ranks);
 * `torch.compile` with `aot_eager` (graph breaks counted, `fullgraph=True`, eager-gradient equality);
@@ -1242,7 +1270,7 @@ Verified on CPU/gloo in this repository (`pytest tests/`, 218 tests — and 236 
 
 **Not verified here — no accelerator in this environment:**
 
-* CUDA offload streams and the pipelined overlap they enable;
+* CUDA offload streams and any copy/backward overlap;
 * async H2D overlap, pinned-buffer reuse and `record_stream` under memory pressure in the batch
   pipeline (the CPU code paths are exercised; the GPU win is unmeasured);
 * kernel launch *speed* on real hardware (correctness is verified through the interpreter; the
